@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------
+# Swing trading bot settings. Every number here is a choice YOU make.
+# Defaults are conservative starting points, not recommendations.
+# ---------------------------------------------------------------
+
+mode: paper            # paper | live  (live also needs CONFIRM_LIVE=YES in .env)
+
+schedule:
+  run_time_et: "10:00" # daily run, 30 min after the open (avoids opening volatility)
+  timezone: "America/New_York"
+
+# SEC requires a contact in the User-Agent for EDGAR requests (your name + email)
+sec_user_agent: "Emmanuel emanmatt711@gmail.com"
+
+# ---------- Who to follow ----------
+signals:
+  weights:             # how much each source counts (normalized automatically)
+    insiders: 0.35     # Form 4 open-market purchases (fastest, ~2 day lag)
+    congress: 0.25     # congressional disclosures (weeks of lag)
+    funds_13f: 0.25    # hedge fund 13F new/increased positions (up to 45 day lag)
+    social: 0.15       # Reddit mention growth (noisy; kept low on purpose)
+
+  insiders:
+    lookback_days: 7
+    min_value_usd: 100000      # ignore small token buys
+    exec_titles: ["CEO", "CFO", "COO", "Pres", "Chairman", "Dir"]
+
+  congress:
+    lookback_days: 45
+    min_amount_usd: 15001      # lower bound of the disclosed range
+
+  funds_13f:
+    # SEC CIK numbers of funds to follow. Edit freely.
+    funds:
+      Berkshire Hathaway: "0001067983"
+      Pershing Square: "0001336528"
+      Appaloosa: "0001656456"
+      Scion Asset Mgmt: "0001649339"
+      Duquesne Family Office: "0001536411"
+    min_increase_pct: 25       # count a position if it grew by at least this much
+    min_position_usd: 10000000
+
+  social:
+    min_mentions: 25
+    min_growth: 1.5            # mentions now vs 24h ago
+
+# ---------- Trend filter (must pass before any buy) ----------
+trend:
+  lookback_days: 300
+  rsi_min: 40
+  rsi_max: 75                  # skip names that are already overextended
+  require_above_sma50: true
+  require_sma20_above_sma50: true
+  min_price: 5
+  min_avg_dollar_volume: 5000000
+
+# ---------- Entry ----------
+entry:
+  min_score: 0.45              # combined score 0..1 needed to buy
+  min_sources: 1               # how many follow-sources must flag the ticker
+  follow_weight: 0.6           # final = follow_weight*follow + (1-follow_weight)*trend
+
+# ---------- Risk (hard limits) ----------
+risk:
+  risk_per_trade_pct: 1.0      # max $ loss per trade if the stop hits, % of equity
+  max_position_pct: 10.0       # max size of one position, % of equity
+  max_total_exposure_pct: 80.0 # max invested, % of equity
+  max_positions: 8
+  max_new_per_day: 2
+  stop_atr_mult: 2.0           # stop-loss distance = 2 x ATR(14)
+  reward_risk: 2.5             # take-profit at 2.5x the stop distance
+  max_daily_loss_pct: 3.0      # no new buys if down this much today
+  max_drawdown_pct: 15.0       # halt all buying if equity falls this far from peak
+
+# ---------- Exits (on top of the bracket stop/target) ----------
+exit:
+  max_hold_days: 30
+  exit_below_sma50: true
+
+journal_path: "data/journal.sqlite"
+cache_dir: "data/cache"
