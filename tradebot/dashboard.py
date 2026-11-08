@@ -200,7 +200,7 @@ with tab_ctl:
             st.error(f"GitHub error: {e}")
             state = "unknown"
         active = state == "active"
-        st.write(f"Schedule: **{'▶️ ON, weekdays ~10:30 AM ET' if active else '⏸ PAUSED'}**")
+        st.write(f"Schedule: **{'▶️ ON: trading all day, 9:45 AM–3:50 PM ET' if active else '⏸ PAUSED'}**")
 
         b1, b2 = st.columns(2)
         if b1.button("▶️ Run now", width="stretch", type="primary", disabled=not active):

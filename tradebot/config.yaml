@@ -5,6 +5,42 @@
 
 mode: paper            # paper | live  (live also needs CONFIRM_LIVE=YES in .env)
 
+# ---------- DAY TRADING (what the GitHub schedule runs) ----------
+# All day: buy breakouts, sell on stop / target / failed move, repeat. Flat by the close.
+day:
+  entry_window_et: ["09:45", "15:15"]  # new buys allowed in this window, all day
+  flatten_at_et: "15:50"        # sell anything still open before the close
+  tick_sec: 60                  # check positions every minute
+  scan_every_sec: 120           # look for a new trade every 2 minutes while flat
+  cooldown_min: 5               # pause after a sale before the next buy
+  exit_below_vwap: true         # sell early if a 5-min bar closes back under VWAP
+  breakeven_at_r: 1.0           # once up 1x the risk, move the stop to break-even
+  morning_until_et: "12:45"     # GitHub jobs max 6h, so the day runs as two sessions
+  afternoon_from_et: "12:40"
+  afternoon_until_et: "15:58"
+  or_minutes: 15                # opening range = first 15 minutes
+  universe_top: 50              # scan today's 50 most active + 50 top gainers
+  min_price: 3
+  max_price: 60                 # small account: keep share prices affordable
+  min_rvol: 1.5                 # volume at least 1.5x a normal day so far
+  min_gap_pct: 1                # must have gapped up at least 1%...
+  max_gap_pct: 20               # ...but not a 20%+ moonshot
+  max_extension_pct: 2.5        # don't chase if already 2.5% past the breakout
+  max_pullback_pct: 2           # skip if it's already fading off the day's high
+  min_stop_pct: 0.5
+  max_stop_pct: 4               # skip trades needing a stop wider than 4%
+  reward_risk: 2                # profit target = 2x the risk
+  min_score: 0.5
+  follow_bonus: 0.15            # small boost if insiders/funds/etc. also like it
+
+  # ---- risk (hard limits) ----
+  risk_per_trade_pct: 2         # max loss per trade if the stop hits (2% of $100 = $2)
+  max_position_pct: 100         # small account: one position may use the whole balance
+  # no cap on trades per day: the daily loss limit is the brake
+  max_open_positions: 1
+  max_daily_loss_pct: 3
+  max_drawdown_pct: 20          # halt if account falls 20% from its high
+
 schedule:
   run_time_et: "10:00" # daily run, 30 min after the open (avoids opening volatility)
   timezone: "America/New_York"
@@ -19,6 +55,15 @@ signals:
     congress: 0.25     # congressional disclosures (weeks of lag)
     funds_13f: 0.25    # hedge fund 13F new/increased positions (up to 45 day lag)
     social: 0.15       # Reddit mention growth (noisy; kept low on purpose)
+    etoro: 0.30        # new buys by top-ranked eToro traders (eToro-verified results)
+
+  etoro:
+    period: "AbsOneYear"       # rank on the trailing 12 months
+    top_traders: 15            # how many traders to follow
+    max_risk_score: 5          # eToro risk score 1-10; 5 or lower = steadier traders
+    max_drawdown_pct: 30       # skip anyone who fell more than this from a peak
+    min_copiers: 300           # others must trust them with real money
+    lookback_days: 14          # count positions opened in the last 2 weeks
 
   insiders:
     lookback_days: 7
