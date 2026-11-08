@@ -1,12 +1,20 @@
 name: Trade bot
 
+# Trades all day in two back-to-back sessions (GitHub jobs max out at 6 hours):
+#   morning   9:25 AM -> 12:45 PM New York
+#   afternoon 12:40 PM -> 3:58 PM New York (waits for the morning one to finish)
+# Times below are UTC for winter and summer; runs that land outside trading
+# hours exit immediately, so daylight saving is handled automatically.
 on:
   schedule:
-    - cron: "30 15 * * 1-5"
+    - cron: "25 14 * * 1-5"   # morning   (winter)
+    - cron: "40 17 * * 1-5"   # afternoon (winter)
+    - cron: "25 13 * * 1-5"   # morning   (summer)
+    - cron: "40 16 * * 1-5"   # afternoon (summer)
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run only (no orders)"
+        description: "Dry run only (one scan, no orders)"
         type: boolean
         default: false
 
@@ -24,7 +32,7 @@ defaults:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,11 +45,12 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           QUIVER_API_KEY: ${{ secrets.QUIVER_API_KEY }}
           OPENFIGI_API_KEY: ${{ secrets.OPENFIGI_API_KEY }}
+          PYTHONUNBUFFERED: "1"
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            python -m bot.main --dry-run
+            python -m bot.day --dry-run
           else
-            python -m bot.main --once
+            python -m bot.day --auto
           fi
       - name: Save trade journal
         if: always()
@@ -49,4 +58,6 @@ jobs:
           git config user.name "tradebot"
           git config user.email "tradebot@users.noreply.github.com"
           git add -f data/journal.sqlite data/cache || true
-          git diff --cached --quiet || git commit -m "journal: $(date -u +%F)" && git push
+          git diff --cached --quiet || git commit -m "journal: $(date -u +%F)"
+          git pull --rebase -q -X ours || true
+          git push || true
