@@ -6,32 +6,51 @@
 mode: paper            # paper | live  (live also needs CONFIRM_LIVE=YES in .env)
 
 # ---------- DAY TRADING (what the GitHub schedule runs) ----------
-# All day: buy breakouts, sell on stop / target / failed move, repeat. Flat by the close.
+# All day: buy breakouts, sell on stop / target / failed move / time limit, repeat. Flat by the close.
 day:
   entry_window_et: ["09:45", "15:15"]  # new buys allowed in this window, all day
   flatten_at_et: "15:50"        # sell anything still open before the close
-  tick_sec: 60                  # check positions every minute
-  scan_every_sec: 120           # look for a new trade every 2 minutes while flat
-  cooldown_min: 5               # pause after a sale before the next buy
-  exit_below_vwap: true         # sell early if a 5-min bar closes back under VWAP
-  breakeven_at_r: 1.0           # once up 1x the risk, move the stop to break-even
   morning_until_et: "12:45"     # GitHub jobs max 6h, so the day runs as two sessions
   afternoon_from_et: "12:40"
   afternoon_until_et: "15:58"
+
+  # ---- speed (fix 3) ----
+  tick_sec: 15                  # check the open trade every 15 seconds
+  scan_every_sec: 30            # look for a new trade every 30 seconds while flat
+  cooldown_min: 2               # pause after a sale before the next buy
+  universe_refresh_sec: 300     # refresh the list of active stocks every 5 min
+
+  # ---- entries (fix 2) ----
+  max_slippage_pct: 0.2         # never pay more than 0.2% above the live price
+  fill_timeout_sec: 15          # if not filled in 15s, cancel and move on
+
+  # ---- what counts as a setup (1-minute bars) ----
   or_minutes: 15                # opening range = first 15 minutes
+  base_minutes: 30              # must clear the high of the last 30 minutes too
+  atr_bars: 15                  # "normal move" = average of the last 15 one-minute ranges
   universe_top: 50              # scan today's 50 most active + 50 top gainers
   min_price: 3
   max_price: 60                 # small account: keep share prices affordable
   min_rvol: 1.5                 # volume at least 1.5x a normal day so far
   min_gap_pct: 1                # must have gapped up at least 1%...
   max_gap_pct: 20               # ...but not a 20%+ moonshot
-  max_extension_pct: 2.5        # don't chase if already 2.5% past the breakout
+  max_extension_pct: 1.5        # don't chase if already 1.5% past the breakout
   max_pullback_pct: 2           # skip if it's already fading off the day's high
-  min_stop_pct: 0.5
-  max_stop_pct: 4               # skip trades needing a stop wider than 4%
-  reward_risk: 2                # profit target = 2x the risk
   min_score: 0.5
   follow_bonus: 0.15            # small boost if insiders/funds/etc. also like it
+
+  # ---- stops (fix 5) ----
+  stop_atr_mult: 1.5            # stop = 1.5x the stock's normal 1-minute move...
+  min_stop_pct: 0.8             # ...but at least 0.8% away...
+  max_stop_pct: 3               # ...and at most 3% away
+
+  # ---- exits (fix 4) ----
+  reward_risk: 1.5              # profit target = 1.5x the risk
+  breakeven_at_r: 0.75          # once up 0.75x the risk, stop moves to break-even
+  time_stop_min: 15             # sell if it hasn't gained...
+  time_stop_gain_r: 0.25        # ...at least 0.25x the risk within 15 minutes
+  exit_below_vwap: true         # sell if a 1-min bar closes back under VWAP...
+  vwap_exit_after_min: 2        # ...after the first 2 minutes
 
   # ---- risk (hard limits) ----
   risk_per_trade_pct: 2         # max loss per trade if the stop hits (2% of $100 = $2)
