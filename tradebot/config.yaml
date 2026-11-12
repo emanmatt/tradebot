@@ -29,14 +29,14 @@ day:
   base_minutes: 30              # must clear the high of the last 30 minutes too
   atr_bars: 15                  # "normal move" = average of the last 15 one-minute ranges
   universe_top: 50              # scan today's 50 most active + 50 top gainers
-  min_price: 3
+  min_price: 2                  # moderate: was 3
   max_price: 60                 # small account: keep share prices affordable
-  min_rvol: 1.5                 # volume at least 1.5x a normal day so far
-  min_gap_pct: 1                # must have gapped up at least 1%...
+  min_rvol: 1.3                 # moderate: volume at least 1.3x normal (was 1.5)
+  min_gap_pct: 0.5              # moderate: gapped up at least 0.5% (was 1)...
   max_gap_pct: 20               # ...but not a 20%+ moonshot
-  max_extension_pct: 1.5        # don't chase if already 1.5% past the breakout
+  max_extension_pct: 2.0        # moderate: may buy up to 2% past the breakout (was 1.5)
   max_pullback_pct: 2           # skip if it's already fading off the day's high
-  min_score: 0.5
+  min_score: 0.45               # moderate: was 0.5
   follow_bonus: 0.15            # small boost if insiders/funds/etc. also like it
 
   # ---- stops (fix 5) ----
@@ -53,11 +53,11 @@ day:
   vwap_exit_after_min: 2        # ...after the first 2 minutes
 
   # ---- risk (hard limits) ----
-  risk_per_trade_pct: 2         # max loss per trade if the stop hits (2% of $100 = $2)
+  risk_per_trade_pct: 3         # moderate: max loss per trade if the stop hits (3% of $100 = $3)
   max_position_pct: 100         # small account: one position may use the whole balance
   # no cap on trades per day: the daily loss limit is the brake
   max_open_positions: 1
-  max_daily_loss_pct: 3
+  max_daily_loss_pct: 6         # moderate: stop buying after a -6% day (was 3)
   max_drawdown_pct: 20          # halt if account falls 20% from its high
 
 schedule:
