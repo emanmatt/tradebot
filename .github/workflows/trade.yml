@@ -1,16 +1,14 @@
 name: Trade bot
 
-# Trades all day in two back-to-back sessions (GitHub jobs max out at 6 hours):
-#   morning   9:25 AM -> 12:45 PM New York
-#   afternoon 12:40 PM -> 3:58 PM New York (waits for the morning one to finish)
-# Times below are UTC for winter and summer; runs that land outside trading
-# hours exit immediately, so daylight saving is handled automatically.
+# Started at 9:20 AM New York by cron-job.org (reliable). The morning session
+# then starts the afternoon session itself at 12:45. The GitHub timers below are
+# only backups; any duplicate run waits its turn and exits if it isn't needed.
 on:
   schedule:
-    - cron: "25 14 * * 1-5"   # morning   (winter)
-    - cron: "40 17 * * 1-5"   # afternoon (winter)
-    - cron: "25 13 * * 1-5"   # morning   (summer)
-    - cron: "40 16 * * 1-5"   # afternoon (summer)
+    - cron: "25 14 * * 1-5"   # backup morning   (winter)
+    - cron: "40 17 * * 1-5"   # backup afternoon (winter)
+    - cron: "25 13 * * 1-5"   # backup morning   (summer)
+    - cron: "40 16 * * 1-5"   # backup afternoon (summer)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -20,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  actions: write              # lets the morning session start the afternoon one
 
 concurrency:
   group: tradebot
@@ -45,6 +44,7 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           QUIVER_API_KEY: ${{ secrets.QUIVER_API_KEY }}
           OPENFIGI_API_KEY: ${{ secrets.OPENFIGI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PYTHONUNBUFFERED: "1"
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
