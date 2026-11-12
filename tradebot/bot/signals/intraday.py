@@ -1,58 +1,68 @@
-"""Intraday opening-range breakout signal from 5-minute bars.
+"""Intraday breakout signal from 1-minute bars.
 
-Idea: stocks that gap up on unusually heavy volume and then break above their
-first-15-minute high, while trading above VWAP, tend to keep running for a while.
-We buy the breakout, put the stop under the opening range, and target 2x the risk.
+Idea: stocks that gapped up and trade on unusually heavy volume, then push to a
+fresh high above both the opening range and their last 30 minutes while above
+VWAP, tend to keep running for a few minutes. The stop is sized from how much
+the stock normally moves per minute, so ordinary wiggles don't knock us out.
 """
-from datetime import time
+from datetime import time, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 ET = ZoneInfo("America/New_York")
-OPEN = time(9, 30)
+OPEN, CLOSE = time(9, 30), time(16, 0)
 
 
-def _et(df: pd.DataFrame) -> pd.DataFrame:
+def to_et(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     df = df.copy()
     idx = pd.DatetimeIndex(df.index)
     df.index = (idx.tz_localize("UTC") if idx.tz is None else idx).tz_convert(ET)
-    return df[(df.index.time >= OPEN) & (df.index.time < time(16, 0))]  # regular hours only
+    return df[(df.index.time >= OPEN) & (df.index.time < CLOSE)].sort_index()
 
 
-def features(bars: pd.DataFrame, or_minutes: int = 15) -> dict | None:
-    """bars: several days of 5-min bars (open, high, low, close, volume), UTC or ET index."""
-    df = _et(bars)
-    if df.empty:
+def features(today: pd.DataFrame, prior: pd.DataFrame, or_minutes: int = 15,
+             base_minutes: int = 30, atr_bars: int = 15) -> dict | None:
+    """today: 1-min bars for the current session. prior: bars (any size) from earlier days."""
+    t, p = to_et(today), to_et(prior)
+    if t.empty or p.empty:
         return None
-    days = sorted(set(df.index.date))
-    today, prior = days[-1], days[:-1]
-    t = df[df.index.date == today]
-    or_end = (pd.Timestamp.combine(today, OPEN) + pd.Timedelta(minutes=or_minutes)).time()
-    rng = t[t.index.time < or_end]
-    after = t[t.index.time >= or_end]
-    if len(rng) < max(1, or_minutes // 5) or after.empty or not prior:
+    day = t.index[-1].date()
+    t = t[t.index.date == day]
+    p = p[p.index.date < day]
+    if t.empty or p.empty:
         return None
 
-    prev_close = float(df[df.index.date == prior[-1]]["close"].iloc[-1])
-    now_t = t.index[-1].time()
+    open_ts = pd.Timestamp.combine(day, OPEN).tz_localize(ET)
+    rng = t[t.index < open_ts + timedelta(minutes=or_minutes)]
+    after = t[t.index >= open_ts + timedelta(minutes=or_minutes)]
+    if rng.empty or len(after) < 2:
+        return None
+
+    now_ts = t.index[-1]
+    prev_close = float(p["close"].iloc[-1])
     tp = (t["high"] + t["low"] + t["close"]) / 3
     vwap = float((tp * t["volume"]).sum() / max(t["volume"].sum(), 1))
 
-    # relative volume: today's volume so far vs the same time window on prior days
-    past = [df[(df.index.date == d) & (df.index.time <= now_t)]["volume"].sum() for d in prior[-5:]]
-    avg_past = np.mean([v for v in past if v > 0]) if any(v > 0 for v in past) else 0
-    rvol = float(t["volume"].sum() / avg_past) if avg_past else 0.0
+    # relative volume: today's volume so far vs the same stretch of the day on prior days
+    past = []
+    for d in sorted(set(p.index.date))[-5:]:
+        pd_ = p[p.index.date == d]
+        past.append(pd_[pd_.index.time <= now_ts.time()]["volume"].sum())
+    past = [v for v in past if v > 0]
+    rvol = float(t["volume"].sum() / np.mean(past)) if past else 0.0
 
-    # the last 30 minutes before the current bar: a fresh breakout clears this range
-    base = after.iloc[-7:-1] if len(after) >= 3 else rng
+    # the 30 minutes before the current bar: a fresh breakout clears this range
+    base = after[(after.index >= now_ts - timedelta(minutes=base_minutes)) & (after.index < now_ts)]
     if base.empty:
         base = rng
 
-    last = t.tail(12)
+    last = t.tail(atr_bars + 1)
     tr = pd.concat([last["high"] - last["low"], (last["high"] - last["close"].shift()).abs(),
-                    (last["low"] - last["close"].shift()).abs()], axis=1).max(axis=1)
+                    (last["low"] - last["close"].shift()).abs()], axis=1).max(axis=1).iloc[1:]
     return {
         "price": float(t["close"].iloc[-1]),
         "or_high": float(rng["high"].max()),
@@ -60,18 +70,24 @@ def features(bars: pd.DataFrame, or_minutes: int = 15) -> dict | None:
         "vwap": vwap,
         "gap_pct": (float(t["open"].iloc[0]) / prev_close - 1) * 100,
         "rvol": rvol,
-        "atr5": float(tr.mean()),
+        "atr1": float(tr.mean()) if len(tr) else float(t["high"].iloc[-1] - t["low"].iloc[-1]),
         "day_high": float(t["high"].max()),
         "base_high": float(base["high"].max()),
         "base_low": float(base["low"].min()),
-        "last_close_5m": float(t["close"].iloc[-2] if len(t) > 1 else t["close"].iloc[-1]),  # last finished bar
+        "last_close": float(t["close"].iloc[-2]),   # last finished 1-min bar
+        "level": float(max(rng["high"].max(), base["high"].max())),
     }
 
 
-def evaluate(f: dict, c: dict) -> tuple[bool, float, str, float, float]:
-    """Return (passes, score 0..1, reason, stop, target)."""
-    p = f["price"]
-    level = max(f["or_high"], f["base_high"])   # must clear both the opening range and the last 30 min
+def stop_distance(price: float, atr1: float, c: dict) -> float:
+    """1.5x the stock's normal 1-minute move, kept between min and max % of price."""
+    d = c["stop_atr_mult"] * atr1
+    return float(np.clip(d, price * c["min_stop_pct"] / 100, price * c["max_stop_pct"] / 100))
+
+
+def evaluate(f: dict, c: dict) -> tuple[bool, float, str]:
+    """Return (passes, score 0..1, reason). Stop/target are set later from the real fill."""
+    p, level = f["price"], f["level"]
     fails = []
     if not c["min_price"] <= p <= c["max_price"]:
         fails.append("price out of range")
@@ -88,21 +104,15 @@ def evaluate(f: dict, c: dict) -> tuple[bool, float, str, float, float]:
         fails.append(f"already {ext:.1f}% past breakout (chasing)")
     if p < f["day_high"] * (1 - c["max_pullback_pct"] / 100):
         fails.append("fading off the high")
-
-    # stop under the range it just broke out of, never closer than min_stop_pct or wider than max_stop_pct
-    stop = max(f["base_low"], f["or_low"], p - 2 * f["atr5"])
-    dist = max(p - stop, p * c["min_stop_pct"] / 100)
-    if dist / p * 100 > c["max_stop_pct"]:
-        fails.append(f"stop would be {dist / p * 100:.1f}% away (too risky)")
+    if f["atr1"] / p * 100 * c["stop_atr_mult"] > c["max_stop_pct"] * 1.5:
+        fails.append("too jumpy for a safe stop")
     if fails:
-        return False, 0.0, ", ".join(fails), 0.0, 0.0
+        return False, 0.0, ", ".join(fails)
 
-    stop = round(p - dist, 2)
-    target = round(p + c["reward_risk"] * dist, 2)
     score = (0.45 * min(f["rvol"] / (3 * c["min_rvol"]), 1)          # heavier volume
              + 0.25 * min(f["gap_pct"] / 8, 1)                          # stronger gap
              + 0.20 * (1 - ext / c["max_extension_pct"])                # fresher breakout
              + 0.10 * min((p / f["vwap"] - 1) * 100 / 2, 1))            # strength vs VWAP
     reason = (f"breakout over ${level:.2f}, gap {f['gap_pct']:+.1f}%, "
               f"volume {f['rvol']:.1f}x, above VWAP ${f['vwap']:.2f}")
-    return True, round(float(np.clip(score, 0, 1)), 3), reason, stop, target
+    return True, round(float(np.clip(score, 0, 1)), 3), reason
