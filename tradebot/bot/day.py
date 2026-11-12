@@ -10,9 +10,11 @@ afternoon one itself when it finishes. Open positions stay protected across the
 hand-off because their stop-loss and target live at Alpaca.
 """
 import argparse
+from collections import Counter
 from datetime import datetime, time, timedelta, timezone
 import logging
 import math
+import json
 import os
 import time as _time
 
@@ -117,6 +119,12 @@ def gates(equity: float, last_equity: float, peak: float, c: dict) -> list[str]:
     return blocks
 
 
+TRADE_LOG = """CREATE TABLE IF NOT EXISTS trade_log (
+    day TEXT, ticker TEXT, opened TEXT, closed TEXT, hold_min REAL, qty REAL,
+    live_at_signal REAL, cap REAL, entry REAL, stop REAL, target REAL, exit REAL, exit_reason TEXT,
+    high REAL, low REAL, pl_usd REAL, r_mult REAL, mfe_r REAL, mae_r REAL, score REAL)"""
+
+
 # ---------------- the trader ----------------
 class DayTrader:
     def __init__(self, cfg: dict, broker=None, journal=None, clock=None, sleep=None):
@@ -136,6 +144,10 @@ class DayTrader:
         self.follow = None
         self.peak = None
         self.trades = 0
+        self.close_at = _hm(self.c["flatten_at_et"])   # adjusted for early-close days in run()
+        self.stats = Counter()    # scans, setups, skip reasons... saved at session end for the audit
+        self.j.db.execute(TRADE_LOG)
+        self.j.db.commit()
 
     # ----- data -----
     def _features(self, syms: list[str], today: dict | None = None) -> dict:
@@ -206,10 +218,33 @@ class DayTrader:
             pass
         return 0.0
 
+    def _record(self, sym: str, exit_px: float, why: str) -> None:
+        """One row per finished trade, with the best and worst price seen while holding it."""
+        plan = self.plans.get(sym)
+        if not plan or not plan.get("qty"):
+            return
+        now = self.clock()
+        e, r, q = plan["entry"], plan["entry"] - plan["stop"], plan["qty"]
+        exit_px = exit_px or e
+        hi, lo = max(plan["hi"], exit_px), min(plan["lo"], exit_px)
+        rr = lambda px: round((px - e) / r, 2) if r > 0 else 0.0  # noqa: E731
+        try:
+            self.j.db.execute("INSERT INTO trade_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                now.date().isoformat(), sym, plan["opened"].isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"), round((now - plan["opened"]).total_seconds() / 60, 1), q,
+                plan.get("live"), plan.get("cap"), e, plan["stop"], plan["target"], exit_px, why,
+                hi, lo, round((exit_px - e) * q, 2), rr(exit_px), rr(hi), rr(lo), plan.get("score")))
+            self.j.db.commit()
+        except Exception as ex:  # noqa: BLE001  logging must never break trading
+            log.warning("trade_log write failed: %s", ex)
+        self.stats["closed_" + ("win" if exit_px > e else "loss" if exit_px < e else "flat")] += 1
+
     def _sell(self, sym: str, pos: dict, why: str) -> None:
         log.info("SELL %s x%g (%+.2f%%): %s", sym, pos["qty"], pos["pl_pct"] * 100, why)
         oid = self.b.close(sym)
-        self.j.order(sym, "sell", pos["qty"], pos["value"] / max(pos["qty"], 1e-9), None, None, why, oid, False)
+        px = pos["value"] / max(pos["qty"], 1e-9)
+        self.j.order(sym, "sell", pos["qty"], px, None, None, why, oid, False)
+        self._record(sym, px, why)
         self._closed(sym, pos["pl_pct"])
 
     def _closed(self, sym: str, pl_pct: float) -> None:
@@ -226,7 +261,8 @@ class DayTrader:
         stop = row[1] if row and row[1] else entry * (1 - self.c["max_stop_pct"] / 100)
         target = row[2] if row and row[2] else entry + self.c["reward_risk"] * (entry - stop)
         opened = datetime.fromisoformat(row[3]).astimezone(ET) if row else self.clock()
-        return {"entry": entry, "stop": stop, "target": target, "opened": opened, "be_done": False}
+        return {"entry": entry, "stop": stop, "target": target, "opened": opened, "be_done": False,
+                "qty": pos.get("qty"), "hi": entry, "lo": entry}
 
     # ----- one tick -----
     def manage(self, pos: dict) -> None:
@@ -234,9 +270,11 @@ class DayTrader:
             if sym not in pos:
                 pl = self.seen[sym]
                 px = self._exit_price(sym)
-                why = "target hit" if pl > 0 else "stop hit"
+                plan = self.plans.get(sym, {})
+                why = "target hit" if pl > 0 else ("break-even stop" if plan.get("be_done") else "stop hit")
                 log.info("%s closed: %s (%+.2f%%)%s", sym, why, pl * 100, f" @ ${px:.2f}" if px else "")
                 self.j.order(sym, "sell", 0, px, None, None, why, "", False)
+                self._record(sym, px or (plan.get("target") if pl > 0 else plan.get("stop")) or 0, why)
                 self._closed(sym, pl)
         if not pos:
             return
@@ -246,6 +284,7 @@ class DayTrader:
             self.seen[sym] = p["pl_pct"]
             plan = self.plans.setdefault(sym, self._plan_from_journal(sym, p))
             price = p["value"] / max(p["qty"], 1e-9)       # Alpaca's live mark
+            plan["hi"], plan["lo"] = max(plan.get("hi", price), price), min(plan.get("lo", price), price)
             r = plan["entry"] - plan["stop"]
             held = (now - plan["opened"]).total_seconds() / 60
             f = feats.get(sym)
@@ -284,6 +323,8 @@ class DayTrader:
                 picks.append({"ticker": s, "score": round(score, 3), "follow": self.follow.get(s, {}).get("follow", 0),
                               "trend": score, "reasons": reasons, "f": f})
         picks.sort(key=lambda p: p["score"], reverse=True)
+        self.stats["scans"] += 1
+        self.stats["scans_with_setup"] += bool(picks)
         log.info("Scanned %d: %d setup(s)%s", len(syms), len(picks),
                  f", best {picks[0]['ticker']} ({picks[0]['score']:.2f})" if picks else "")
         return picks
@@ -297,15 +338,18 @@ class DayTrader:
             live = live_price(self.b, sym)
             if not live or live <= f["level"]:
                 log.info("skip %s: live price $%.2f back under the breakout $%.2f", sym, live or 0, f["level"])
+                self.stats["skip_fell_back"] += 1
                 continue
             if (live / f["level"] - 1) * 100 > c["max_extension_pct"]:
                 log.info("skip %s: ran to $%.2f, too far past the breakout to chase", sym, live)
+                self.stats["skip_chase"] += 1
                 continue
             dist = stop_distance(live, f["atr1"], c)
             limit = live * (1 + c["max_slippage_pct"] / 100)
             qty = size(a["equity"], a["buying_power"], limit, limit - dist, c)
             if qty < 1:
                 log.info("skip %s: can't afford a share within risk limits", sym)
+                self.stats["skip_cant_afford"] += 1
                 continue
             if dry:
                 log.info("WOULD BUY %s x%d, cap $%.2f | stop ~$%.2f | target ~$%.2f | score %.2f",
@@ -318,6 +362,7 @@ class DayTrader:
             if got <= 0:
                 log.info("skip %s: no fill at or below $%.2f within %ds (price ran)", sym, limit, c["fill_timeout_sec"])
                 self.skip_until[sym] = self.clock() + timedelta(minutes=10)
+                self.stats["skip_no_fill"] += 1
                 continue
             stop, target = round(fill - dist, 2), round(fill + c["reward_risk"] * dist, 2)
             try:
@@ -333,8 +378,11 @@ class DayTrader:
                 log.info("    - %s", r)
             self.j.order(sym, "buy", got, fill, stop, target, f"day score {p['score']}", "", False)
             self.j.signal(p, True)
-            self.plans[sym] = {"entry": fill, "stop": stop, "target": target, "opened": self.clock(), "be_done": False}
+            self.plans[sym] = {"entry": fill, "stop": stop, "target": target, "opened": self.clock(),
+                               "be_done": False, "qty": got, "hi": fill, "lo": fill,
+                               "live": live, "cap": round(limit, 2), "score": p["score"]}
             self.trades += 1
+            self.stats["buys"] += 1
             return True
         return False
 
@@ -349,7 +397,7 @@ class DayTrader:
         self.manage(self.b.positions())
         pos = self.b.positions()
 
-        if now.time() >= _hm(self.c["flatten_at_et"]):
+        if now.time() >= self.close_at:
             if pos:
                 self.flatten()
             return
@@ -369,14 +417,25 @@ class DayTrader:
                     log.warning("NO NEW BUYS: %s", m)
                     self.j.event("warn", m)
                 self._warned = True
+                self.stats["loss_limit_hit"] = 1
             return
         self.last_scan = now
         self.buy(self.scan(), a, dry=False)
 
     def run(self, until: time) -> None:
         a = self.b.account()
+        try:  # half days (e.g. day after Thanksgiving) close at 1 PM: sell 10 min before the real close
+            nc = self.b.trading.get_clock().next_close.astimezone(ET)
+            if nc.date() == self.clock().date():
+                self.close_at = min(self.close_at, (nc - timedelta(minutes=10)).time())
+                if self.close_at < _hm(self.c["flatten_at_et"]):
+                    log.info("Early close today at %s: selling everything by %s", nc.strftime("%H:%M"), self.close_at)
+        except Exception:  # noqa: BLE001
+            pass
         self.j.equity(a["equity"], a["cash"], 0, self.mode)
+        self.j.event("session_start", f"{self.clock().isoformat(timespec='seconds')} until {until}")
         log.info("=== SESSION START | %s | equity $%.2f | runs until %s ET ===", self.mode, a["equity"], until)
+        until = min(until, (datetime.combine(self.clock().date(), self.close_at) + timedelta(minutes=8)).time())
         while self.clock().time() < until:
             if not self.b.market_open():
                 if self.clock().time() < time(9, 31):   # started a few minutes early: wait for the bell
@@ -388,9 +447,15 @@ class DayTrader:
                 self.tick()
             except Exception as e:  # noqa: BLE001  one bad tick never kills the session
                 log.warning("tick error: %s", e)
+                self.stats["tick_errors"] += 1
+                if self.stats["tick_errors"] <= 5:
+                    self.j.event("error", f"tick error: {e}"[:300])
             self.sleep(self.c["tick_sec"])
         a = self.b.account()
         self.j.equity(a["equity"], a["cash"], sum(p["value"] for p in self.b.positions().values()), self.mode)
+        self.j.event("session_end", json.dumps({"at": self.clock().isoformat(timespec="seconds"),
+                                                "equity": a["equity"], "day_pl": round(a["equity"] - a["last_equity"], 2),
+                                                **self.stats}))
         log.info("=== SESSION END | %d trade(s) | day P/L $%+.2f ===", self.trades, a["equity"] - a["last_equity"])
 
 
