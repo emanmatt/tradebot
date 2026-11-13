@@ -20,9 +20,11 @@ day:
   cooldown_min: 2               # pause after a sale before the next buy
   universe_refresh_sec: 300     # refresh the list of active stocks every 5 min
 
-  # ---- entries (fix 2) ----
-  max_slippage_pct: 0.2         # never pay more than 0.2% above the live price
-  fill_timeout_sec: 15          # if not filled in 15s, cancel and move on
+  # ---- entries: buy the pullback, not the spike ----
+  pullback_buffer_pct: 0.1      # bid at the breakout level (+0.1%) instead of the current price
+  pullback_wait_sec: 120        # wait up to 2 min for the dip; no dip = no trade
+  no_pullback_retry_min: 5      # if it never dipped, ignore that stock for 5 min
+  fill_timeout_sec: 15          # (fallback wait for other buy orders)
 
   # ---- what counts as a setup (1-minute bars) ----
   or_minutes: 15                # opening range = first 15 minutes
@@ -43,6 +45,7 @@ day:
   stop_atr_mult: 1.5            # stop = 1.5x the stock's normal 1-minute move...
   min_stop_pct: 0.8             # ...but at least 0.8% away...
   max_stop_pct: 3               # ...and at most 3% away
+  min_stop_usd: 0.05            # ...and never closer than 5 cents (cheap stocks wobble)
 
   # ---- exits (fix 4) ----
   reward_risk: 1.5              # profit target = 1.5x the risk
