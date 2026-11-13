@@ -80,9 +80,11 @@ def features(today: pd.DataFrame, prior: pd.DataFrame, or_minutes: int = 15,
 
 
 def stop_distance(price: float, atr1: float, c: dict) -> float:
-    """1.5x the stock's normal 1-minute move, kept between min and max % of price."""
+    """1.5x the stock's normal 1-minute move, kept between min and max % of price,
+    and never closer than min_stop_usd (a 2-cent stop on a $2 stock is just noise)."""
     d = c["stop_atr_mult"] * atr1
-    return float(np.clip(d, price * c["min_stop_pct"] / 100, price * c["max_stop_pct"] / 100))
+    d = float(np.clip(d, price * c["min_stop_pct"] / 100, price * c["max_stop_pct"] / 100))
+    return max(d, c.get("min_stop_usd", 0.0))
 
 
 def evaluate(f: dict, c: dict) -> tuple[bool, float, str]:
