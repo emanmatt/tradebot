@@ -34,6 +34,9 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main               # always start from the LATEST journal, not the one at trigger time
+          fetch-depth: 0          # full history so the save step can replay cleanly
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -57,7 +60,19 @@ jobs:
         run: |
           git config user.name "tradebot"
           git config user.email "tradebot@users.noreply.github.com"
-          git add -f data/journal.sqlite data/cache || true
-          git diff --cached --quiet || git commit -m "journal: $(date -u +%F)"
-          git pull --rebase -q -X ours || true
-          git push || true
+          git add -f data/journal.sqlite
+          git add -f data/cache 2>/dev/null || true
+          git diff --cached --quiet && exit 0
+          git commit -q -m "journal: $(date -u +%F)"
+          for i in 1 2 3; do
+            # sessions run one at a time, so the journal itself never conflicts;
+            # this only replays our commit on top of any files you uploaded meanwhile
+            git fetch -q origin main
+            if git rebase -q -X theirs origin/main && git push -q origin HEAD:main; then
+              echo "journal saved"; exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          echo "::error::could not save the trade journal"
+          exit 1
