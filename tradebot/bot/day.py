@@ -172,12 +172,13 @@ class DayTrader:
             take_profit=TakeProfitRequest(limit_price=round(target, 2)),
             stop_loss=StopLossRequest(stop_price=round(stop, 2))))
 
-    def _buy_capped(self, sym: str, qty: int, limit: float) -> tuple[float, float]:
-        """Limit buy that won't pay more than `limit`. Returns (filled_qty, avg_fill_price)."""
+    def _buy_capped(self, sym: str, qty: int, limit: float, wait: float | None = None) -> tuple[float, float]:
+        """Limit buy that won't pay more than `limit`; waits up to `wait` seconds. Returns (filled_qty, avg_price)."""
+        wait = self.c["fill_timeout_sec"] if wait is None else wait
         o = self.b.trading.submit_order(LimitOrderRequest(
             symbol=sym, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY, limit_price=round(limit, 2)))
         waited = 0.0
-        while waited < self.c["fill_timeout_sec"]:
+        while waited < wait:
             o = self.b.trading.get_order_by_id(o.id)
             st = str(o.status).lower()
             if (st.endswith("filled") and not st.endswith("partially_filled")) or \
@@ -271,7 +272,14 @@ class DayTrader:
                 pl = self.seen[sym]
                 px = self._exit_price(sym)
                 plan = self.plans.get(sym, {})
-                why = "target hit" if pl > 0 else ("break-even stop" if plan.get("be_done") else "stop hit")
+                if px and plan.get("entry"):
+                    pl = px / plan["entry"] - 1
+                if px and plan.get("target") and px >= plan["target"] - 0.005:
+                    why = "target hit"
+                elif plan.get("be_done") and (not px or px >= plan["entry"] - 0.005):
+                    why = "break-even stop"
+                else:
+                    why = "stop hit" if pl <= 0 else "stop hit (in profit)"
                 log.info("%s closed: %s (%+.2f%%)%s", sym, why, pl * 100, f" @ ${px:.2f}" if px else "")
                 self.j.order(sym, "sell", 0, px, None, None, why, "", False)
                 self._record(sym, px or (plan.get("target") if pl > 0 else plan.get("stop")) or 0, why)
@@ -336,33 +344,38 @@ class DayTrader:
             if not self.b.tradable(sym):
                 continue
             live = live_price(self.b, sym)
-            if not live or live <= f["level"]:
-                log.info("skip %s: live price $%.2f back under the breakout $%.2f", sym, live or 0, f["level"])
+            if not live or live < f["level"] * (1 - c["pullback_buffer_pct"] * 3 / 100):
+                log.info("skip %s: live price $%.2f fell back under the breakout $%.2f", sym, live or 0, f["level"])
                 self.stats["skip_fell_back"] += 1
                 continue
             if (live / f["level"] - 1) * 100 > c["max_extension_pct"]:
                 log.info("skip %s: ran to $%.2f, too far past the breakout to chase", sym, live)
                 self.stats["skip_chase"] += 1
                 continue
+            # buy the dip back to the breakout level, not the spike
             dist = stop_distance(live, f["atr1"], c)
-            limit = live * (1 + c["max_slippage_pct"] / 100)
+            limit = math.ceil(f["level"] * (1 + c["pullback_buffer_pct"] / 100) * 100) / 100
+            limit = min(limit, live)
             qty = size(a["equity"], a["buying_power"], limit, limit - dist, c)
             if qty < 1:
                 log.info("skip %s: can't afford a share within risk limits", sym)
                 self.stats["skip_cant_afford"] += 1
                 continue
             if dry:
-                log.info("WOULD BUY %s x%d, cap $%.2f | stop ~$%.2f | target ~$%.2f | score %.2f",
-                         sym, qty, limit, live - dist, live + c["reward_risk"] * dist, p["score"])
+                log.info("WOULD BID %s x%d at $%.2f (now $%.2f), wait %ds | stop ~$%.2f | target ~$%.2f | score %.2f",
+                         sym, qty, limit, live, c["pullback_wait_sec"], limit - dist,
+                         limit + c["reward_risk"] * dist, p["score"])
                 for r in p["reasons"]:
                     log.info("    - %s", r)
                 return True
 
-            got, fill = self._buy_capped(sym, qty, limit)
+            log.info("BID %s x%d at $%.2f (now $%.2f): waiting up to %ds for a pullback",
+                     sym, qty, limit, live, c["pullback_wait_sec"])
+            got, fill = self._buy_capped(sym, qty, limit, c["pullback_wait_sec"])
             if got <= 0:
-                log.info("skip %s: no fill at or below $%.2f within %ds (price ran)", sym, limit, c["fill_timeout_sec"])
-                self.skip_until[sym] = self.clock() + timedelta(minutes=10)
-                self.stats["skip_no_fill"] += 1
+                log.info("skip %s: no pullback to $%.2f within %ds", sym, limit, c["pullback_wait_sec"])
+                self.skip_until[sym] = self.clock() + timedelta(minutes=c["no_pullback_retry_min"])
+                self.stats["skip_no_pullback"] += 1
                 continue
             stop, target = round(fill - dist, 2), round(fill + c["reward_risk"] * dist, 2)
             try:
@@ -372,7 +385,7 @@ class DayTrader:
                 self.b.close(sym)
                 self.j.order(sym, "sell", got, fill, None, None, "safety: stop order failed", "", False)
                 continue
-            log.info("BUY %s x%g filled @ $%.2f (cap $%.2f) | stop $%.2f | target $%.2f | risk $%.2f | score %.2f",
+            log.info("BUY %s x%g filled @ $%.2f (bid $%.2f) | stop $%.2f | target $%.2f | risk $%.2f | score %.2f",
                      sym, got, fill, limit, stop, target, got * (fill - stop), p["score"])
             for r in p["reasons"]:
                 log.info("    - %s", r)
@@ -381,6 +394,7 @@ class DayTrader:
             self.plans[sym] = {"entry": fill, "stop": stop, "target": target, "opened": self.clock(),
                                "be_done": False, "qty": got, "hi": fill, "lo": fill,
                                "live": live, "cap": round(limit, 2), "score": p["score"]}
+            self.seen[sym] = 0.0           # so a trade that closes within seconds is still noticed
             self.trades += 1
             self.stats["buys"] += 1
             return True
@@ -467,18 +481,20 @@ def session_end(now: datetime, c: dict) -> time | None:
     return _hm(c["morning_until_et"]) if t < _hm(c["afternoon_from_et"]) else _hm(c["afternoon_until_et"])
 
 
-def start_afternoon() -> None:
+def start_afternoon() -> str:
     """Morning session hands off to the afternoon one (no waiting on GitHub's timer)."""
     token, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
-        return
+        return "no GITHUB_TOKEN/GITHUB_REPOSITORY in environment"
     try:
         r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/trade.yml/dispatches",
                           headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
                           json={"ref": "main", "inputs": {"dry_run": "false"}}, timeout=20)
         log.info("afternoon session requested (HTTP %s)", r.status_code)
+        return f"HTTP {r.status_code} {r.text[:200]}".strip()
     except Exception as e:  # noqa: BLE001
         log.warning("couldn't request afternoon session: %s (backup timers will start it)", e)
+        return f"error: {e}"[:250]
 
 
 def main():
@@ -500,9 +516,13 @@ def main():
     if end is None:
         log.info("%s ET is outside trading hours, nothing to do.", t.clock().strftime("%H:%M"))
         return
-    t.run(end)
     if end == _hm(cfg["day"]["morning_until_et"]):
-        start_afternoon()
+        # hand off a minute before the morning session ends, and record what GitHub answered
+        t.run(time(12, 44) if end > time(12, 44) else end)
+        t.j.event("handoff", start_afternoon())
+        t.run(end)
+    else:
+        t.run(end)
 
 
 if __name__ == "__main__":
