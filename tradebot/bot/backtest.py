@@ -400,6 +400,343 @@ VARIANTS = [
 ]
 
 
+# ======================= suite "new": stocks-in-play ORB, news filter, last-half-hour momentum ========
+ORB = {"min_price": 5.0, "min_avg_vol": 1_000_000, "min_atr": 0.50, "min_rvol": 1.0, "top": 20,
+       "or_bars": 5, "stop_atr_frac": 0.10, "risk_pct": 1.0, "exit_bar": idx(15, 55), "slip": 0.01,
+       "rvol_days": 14, "min_rvol_history": 5,
+       "max_alloc_pct": 20.0}            # no borrowing: cap each position at 20% of the account (5 at once)
+
+
+def daily_features(daily: pd.DataFrame) -> pd.DataFrame:
+    """Adds prev_close, 14-day average volume and 14-day ATR, all known BEFORE each day's open."""
+    d = daily.sort_values(["symbol", "day"]).copy()
+    g = d.groupby("symbol")
+    pc = g["close"].shift(1)
+    d["prev_close"] = pc
+    d["tr"] = np.maximum(d["high"] - d["low"], np.maximum((d["high"] - pc).abs(), (d["low"] - pc).abs()))
+    d["avg_vol14"] = g["volume"].transform(lambda v: v.shift(1).rolling(14, min_periods=10).mean())
+    d["atr14"] = d.groupby("symbol")["tr"].transform(lambda v: v.shift(1).rolling(14, min_periods=10).mean())
+    return d
+
+
+def _retry(fn, tries: int = 6):
+    """Alpaca's free plan allows ~200 requests/min: on 'too many requests' wait and try again."""
+    import time as _t
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if i == tries - 1 or not any(k in msg for k in ("429", "too many", "rate limit", "timed out", "503", "502")):
+                raise
+            log.info("  rate limited, waiting %ds...", 10 * (i + 1))
+            _t.sleep(10 * (i + 1))
+
+
+def first5(dc, syms: list[str], d: date, feed) -> dict:
+    """{symbol: (open, close, high, volume)} for the first 5 minutes (9:30-9:34)."""
+    from alpaca.data.enums import Adjustment
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    start = datetime.combine(d, time(9, 30), ET)
+    out = {}
+    for i in range(0, len(syms), 400):
+        req = StockBarsRequest(symbol_or_symbols=syms[i:i + 400], timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                               start=start, end=start + timedelta(minutes=4, seconds=59), feed=feed,
+                               adjustment=Adjustment.SPLIT)
+        df = _retry(lambda: dc.get_stock_bars(req)).df
+        if df.empty:
+            continue
+        for s, g in df.groupby(level=0):
+            out[s] = (float(g["open"].iloc[0]), float(g["close"].iloc[-1]), float(g["high"].max()),
+                      float(g["volume"].sum()))
+    return out
+
+
+def news_counts(syms: list[str], start: datetime, end: datetime) -> dict:
+    """How many news stories mention each symbol between start and end (Benzinga via Alpaca)."""
+    from alpaca.data.historical.news import NewsClient
+    from alpaca.data.requests import NewsRequest
+    nc = NewsClient(env("ALPACA_API_KEY"), env("ALPACA_SECRET_KEY"))
+    ns = _retry(lambda: nc.get_news(NewsRequest(symbols=",".join(syms), start=start, end=end,
+                                                exclude_contentless=False)))
+    counts = defaultdict(int)
+    for n in ns.data.get("news", []):
+        for s in n.symbols:
+            if s in syms:
+                counts[s] += 1
+    return dict(counts)
+
+
+def orb_trade(g: pd.DataFrame, atr: float, cfg: dict) -> dict | None:
+    """Long-only 5-minute opening-range breakout held to the close (stop = 10% of daily ATR).
+    Returns None if the first 5 minutes weren't up or the breakout never came."""
+    o, h, l, c = (np.array(g[k], dtype=float) for k in ("open", "high", "low", "close"))
+    k5 = cfg["or_bars"]
+    if np.isnan(o[0]) or np.isnan(c[k5 - 1]) or c[k5 - 1] <= o[0]:
+        return None
+    orh = np.nanmax(h[:k5])
+    slip, last = cfg["slip"], cfg["exit_bar"]
+    for t in range(k5, last + 1):
+        if h[t] >= orh:
+            break
+    else:
+        return None
+    gross_fill = max(o[t], orh)
+    fill = gross_fill + slip
+    dist = cfg["stop_atr_frac"] * atr
+    stop = gross_fill - dist
+    exit_bar, gross_exit, why = last, c[last], "close"
+    if c[t] <= stop:                        # broke out and collapsed within the same minute
+        exit_bar, gross_exit, why = t, stop, "stop"
+    else:
+        for k in range(t + 1, last + 1):
+            if o[k] <= stop:
+                exit_bar, gross_exit, why = k, o[k], "stop"
+                break
+            if l[k] <= stop:
+                exit_bar, gross_exit, why = k, stop, "stop"
+                break
+    exit_px = gross_exit - slip
+    return {"entry_bar": t, "exit_bar": exit_bar, "fill": fill, "stop": stop, "dist": dist, "exit": exit_px,
+            "why": why, "r": (exit_px - fill) / dist, "r_gross": (gross_exit - gross_fill) / dist}
+
+
+def run_orb(days: list[date], picks: dict, bars: dict, news: dict | None, which: str, cfg: dict,
+            start_equity: float = 100.0) -> tuple[list[dict], list[dict]]:
+    """which: 'all' | 'news' | 'no_news'. Fractional shares, no borrowing, risk 1% of equity per trade."""
+    eq, trades, daily = start_equity, [], []
+    for d in days:
+        cands = []
+        for s, info in picks.get(d, {}).items():
+            if which != "all" and news is not None:
+                has = news.get(d, {}).get(s, 0) > 0
+                if (which == "news") != has:
+                    continue
+            g = bars.get(d, {}).get(s)
+            if g is None:
+                continue
+            tr = orb_trade(g, info["atr"], cfg)
+            if tr:
+                cands.append((tr["entry_bar"], -info["rvol"], s, tr))
+        cands.sort(key=lambda x: (x[0], x[1]))          # earliest breakout first; ties: most unusual volume
+        day_eq, cash, open_pos, pl_day = eq, eq, [], 0.0
+        for bar, _, s, tr in cands:
+            for p in [p for p in open_pos if p[0] < bar]:      # positions that already closed free their cash
+                cash += p[1]
+                open_pos.remove(p)
+            qty = min(day_eq * cfg["risk_pct"] / 100 / tr["dist"],
+                      day_eq * cfg["max_alloc_pct"] / 100 / tr["fill"], cash / tr["fill"])
+            if qty * tr["fill"] < 1.0:                            # Alpaca's $1 minimum order
+                continue
+            cost = qty * tr["fill"]
+            pl = (tr["exit"] - tr["fill"]) * qty
+            cash -= cost
+            open_pos.append((tr["exit_bar"], cost + pl))
+            pl_day += pl
+            trades.append({"day": d.isoformat(), "symbol": s, "entry_time": _hhmm(tr["entry_bar"]),
+                           "exit_time": _hhmm(tr["exit_bar"]), "why": tr["why"], "qty": round(qty, 4),
+                           "fill": round(tr["fill"], 4), "stop": round(tr["stop"], 4), "exit": round(tr["exit"], 4),
+                           "pl": round(pl, 4), "r": round(tr["r"], 3), "r_gross": round(tr["r_gross"], 3),
+                           "rvol": round(picks[d][s]["rvol"], 2), "news": (news or {}).get(d, {}).get(s)})
+        eq += pl_day
+        daily.append({"day": d.isoformat(), "equity": round(eq, 4), "pl": round(pl_day, 4)})
+    return trades, daily
+
+
+def run_momentum(days: list[date], bars: dict, prev_close: dict, sym: str, slip: float = 0.01,
+                 start_equity: float = 100.0) -> tuple[list[dict], list[dict]]:
+    """If `sym` is up from yesterday's close at 10:00, buy at 3:30 and sell at the close. Long only."""
+    eq, trades, daily = start_equity, [], []
+    for d in days:
+        g = bars.get(d, {}).get(sym)
+        pc = prev_close.get(d, {}).get(sym)
+        if g is not None and pc:
+            p10, buy, sell = g["close"].iloc[idx(9, 59)], g["open"].iloc[idx(15, 30)], g["close"].iloc[N - 1]
+            if p10 > pc and not np.isnan(buy) and not np.isnan(sell):
+                ret = (sell - slip) / (buy + slip) - 1
+                trades.append({"day": d.isoformat(), "symbol": sym, "first_half_hour_pct": round((p10 / pc - 1) * 100, 2),
+                               "buy": round(buy, 2), "sell": round(sell, 2), "ret_pct": round(ret * 100, 3),
+                               "pl": round(eq * ret, 4)})
+                eq *= 1 + ret
+        daily.append({"day": d.isoformat(), "equity": round(eq, 4)})
+    return trades, daily
+
+
+def stats2(trades: list[dict], daily: list[dict], unit: str, start_equity: float = 100.0) -> dict:
+    if not trades:
+        return {"trades": 0}
+    t = pd.DataFrame(trades)
+    key = "r" if unit == "R" else "ret_pct"
+    eq = pd.Series([start_equity] + [d["equity"] for d in daily])
+    wins, losses = t[t.pl > 0], t[t.pl < 0]
+    half = len(t) // 2
+    out = {"trades": len(t), "per_day": round(len(t) / max(len(daily), 1), 2),
+           "win_pct": round(len(wins) / len(t) * 100, 1),
+           "avg": round(t[key].mean(), 3), "avg_win": round(wins[key].mean(), 3) if len(wins) else 0.0,
+           "avg_loss": round(losses[key].mean(), 3) if len(losses) else 0.0,
+           "gross": round(t["r_gross"].mean(), 3) if "r_gross" in t else None,
+           "pf": round(wins.pl.sum() / -losses.pl.sum(), 2) if len(losses) and losses.pl.sum() else float("inf"),
+           "return_pct": round((eq.iloc[-1] / start_equity - 1) * 100, 1),
+           "max_dd_pct": round(((eq.cummax() - eq) / eq.cummax()).max() * 100, 1),
+           "first_half": round(t[key].iloc[:half].mean(), 3) if half else 0.0,
+           "second_half": round(t[key].iloc[half:].mean(), 3) if half else 0.0}
+    return {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in out.items()}
+
+
+def verdict2(s: dict) -> str:
+    if s.get("trades", 0) < 40:
+        return "too few trades to judge"
+    if s["avg"] > 0 and s["pf"] >= 1.2 and s["first_half"] > 0 and s["second_half"] > 0:
+        return "PROMISING (positive in both halves)"
+    if s["avg"] > 0 and s["pf"] > 1:
+        return "marginal (not robust)"
+    return "LOSES MONEY"
+
+
+def report2(res: dict, meta: dict) -> str:
+    L = [f"# New strategies backtest: {meta['start']} to {meta['end']}", "",
+         f"{meta['days']} trading days. $100 start, long only, fractional shares, no borrowing "
+         f"(max 20% of the account per position). "
+         f"Costs: 1 cent per share on every buy and sell. Full-market (SIP) minute data. "
+         f"SPY over the period: {meta['spy_ret']:+.1f}%.", "",
+         f"Stocks in play per day (avg): {meta['avg_in_play']:.1f}; with overnight news: {meta['news_share']}.", "",
+         "## Opening-range breakout on stocks in play (results in R = multiples of the amount risked)", "",
+         "| Version | Trades | /day | Win % | Avg win R | Avg loss R | Avg R after costs | Avg R before costs "
+         "| Profit factor | Return | Max DD | 1st half R | 2nd half R | Verdict |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for name, (s, _, _) in res.items():
+        if not name.startswith("ORB"):
+            continue
+        if not s.get("trades"):
+            L.append(f"| {name} | 0 | | | | | | | | | | | | no trades |")
+            continue
+        L.append(f"| {name} | {s['trades']} | {s['per_day']} | {s['win_pct']} | {s['avg_win']} | {s['avg_loss']} | "
+                 f"{s['avg']:+.3f} | {s['gross']:+.3f} | {s['pf']} | {s['return_pct']:+.1f}% | {s['max_dd_pct']}% | "
+                 f"{s['first_half']:+.3f} | {s['second_half']:+.3f} | {verdict2(s)} |")
+    L += ["", "## Last-half-hour market momentum (results in % per trade)", "",
+          "| Version | Trades | Win % | Avg trade | Avg win | Avg loss | Profit factor | Return | Max DD "
+          "| 1st half | 2nd half | Verdict |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for name, (s, _, _) in res.items():
+        if not name.startswith("MOM"):
+            continue
+        if not s.get("trades"):
+            L.append(f"| {name} | 0 | | | | | | | | | | no trades |")
+            continue
+        L.append(f"| {name} | {s['trades']} | {s['win_pct']} | {s['avg']:+.3f}% | {s['avg_win']:+.3f}% | "
+                 f"{s['avg_loss']:+.3f}% | {s['pf']} | {s['return_pct']:+.1f}% | {s['max_dd_pct']}% | "
+                 f"{s['first_half']:+.3f}% | {s['second_half']:+.3f}% | {verdict2(s)} |")
+    for name, (s, tr, _) in res.items():
+        if not tr:
+            continue
+        t = pd.DataFrame(tr)
+        t["month"] = t.day.str[:7]
+        key = "r" if name.startswith("ORB") else "ret_pct"
+        g = t.groupby("month").agg(n=(key, "size"), avg=(key, "mean"), pl=("pl", "sum"))
+        L += ["", f"### {name}", "By month: " + "; ".join(f"{m}: {int(r.n)} trades, avg {r.avg:+.3f}, ${r.pl:+.2f}"
+                                                         for m, r in g.iterrows())]
+        if name.startswith("ORB"):
+            L.append("Exits: " + ", ".join(f"{k} {v}" for k, v in t.why.value_counts().items()))
+    return "\n".join(L) + "\n"
+
+
+def run_new(months: float, out_dir: Path) -> Path:
+    from alpaca.data.enums import DataFeed
+    import time as _t
+    cfg = ORB
+    tc, dc = _clients()
+    end = datetime.now(ET).date() - timedelta(days=1)
+    start = end - timedelta(days=int(months * 30.5))
+    sip = DataFeed.SIP
+
+    log.info("Listing symbols...")
+    syms = sorted(set(all_symbols(tc)) | {"SPY", "QQQ"})
+    log.info("%d symbols. Daily bars...", len(syms))
+    daily = daily_features(daily_bars(dc, syms, start - timedelta(days=70), end, sip))
+    by_day = dict(tuple(daily.groupby("day")))
+    all_days = sorted(by_day)
+    days = [d for d in all_days if start <= d <= end]
+    warm = [d for d in all_days if d < start][-(cfg["rvol_days"] + 2):]
+
+    # 1) first-5-minute volume for every liquid stock, every day (warm-up days build the baseline)
+    hist = defaultdict(list)
+    picks, n_in_play = {}, []
+    for i, d in enumerate(warm + days):
+        g = by_day[d]
+        ok = g[(g.prev_close >= cfg["min_price"]) & (g.avg_vol14 >= cfg["min_avg_vol"]) & (g.atr14 >= cfg["min_atr"])]
+        f5 = first5(dc, ok.symbol.tolist(), d, sip)
+        _t.sleep(0.2)
+        if d in days:
+            rows = []
+            atr = dict(zip(ok.symbol, ok.atr14))
+            for s, (o, c, h, v) in f5.items():
+                past = hist[s][-cfg["rvol_days"]:]
+                if len(past) < cfg["min_rvol_history"] or o < cfg["min_price"]:
+                    continue
+                rv = v / max(np.mean(past), 1)
+                if rv >= cfg["min_rvol"]:
+                    rows.append((rv, s))
+            rows.sort(reverse=True)
+            picks[d] = {s: {"rvol": rv, "atr": atr[s]} for rv, s in rows[:cfg["top"]]}
+            n_in_play.append(len(picks[d]))
+        for s, (_, _, _, v) in f5.items():
+            hist[s].append(v)
+        if (i + 1) % 10 == 0:
+            log.info("  first-5-min scan: %d / %d days", i + 1, len(warm) + len(days))
+
+    # 2) full minute bars for the stocks in play (+ SPY, QQQ) and 3) overnight news
+    bars, news, news_ok = {}, {}, True
+    prev_close = {d: {s: float(by_day[d].set_index("symbol").prev_close.get(s, np.nan)) for s in ("SPY", "QQQ")}
+                  for d in days}
+    for i, d in enumerate(days):
+        want = sorted(set(picks.get(d, {})) | {"SPY", "QQQ"})
+        try:
+            bars[d] = _retry(lambda: minute_grid(dc, want, d, sip))
+        except Exception as e:  # noqa: BLE001
+            log.warning("  %s minute bars failed: %s", d, e)
+            continue
+        if news_ok and picks.get(d):
+            prev_day = all_days[all_days.index(d) - 1]
+            try:
+                news[d] = news_counts(list(picks[d]), datetime.combine(prev_day, time(16, 0), ET),
+                                      datetime.combine(d, time(9, 30), ET))
+            except Exception as e:  # noqa: BLE001
+                log.warning("news history unavailable (%s): skipping the news split", e)
+                news_ok, news = False, None
+        if (i + 1) % 10 == 0:
+            log.info("  minute bars + news: %d / %d days", i + 1, len(days))
+    days = [d for d in days if d in bars]
+
+    res = {}
+    for name, which in (("ORB stocks in play (all)", "all"), ("ORB with overnight news", "news"),
+                        ("ORB without news", "no_news")):
+        if which != "all" and news is None:
+            continue
+        tr, dl = run_orb(days, picks, bars, news, which, cfg)
+        res[name] = (stats2(tr, dl, "R"), tr, dl)
+        log.info("%-32s %s", name, res[name][0])
+    for sym in ("SPY", "QQQ"):
+        tr, dl = run_momentum(days, bars, prev_close, sym)
+        res[f"MOM {sym} last half-hour"] = (stats2(tr, dl, "%"), tr, dl)
+        log.info("MOM %s %s", sym, res[f"MOM {sym} last half-hour"][0])
+
+    in_play_news = [news[d].get(s, 0) > 0 for d in days if news and d in news for s in picks.get(d, {})]
+    spy = daily[daily.symbol == "SPY"].set_index("day")
+    meta = {"start": days[0], "end": days[-1], "days": len(days),
+            "spy_ret": float((spy.loc[days[-1], "close"] / spy.loc[days[0], "open"] - 1) * 100),
+            "avg_in_play": float(np.mean(n_in_play)) if n_in_play else 0.0,
+            "news_share": f"{np.mean(in_play_news) * 100:.0f}%" if in_play_news else "n/a"}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(ET).strftime("%Y-%m-%d")
+    md = out_dir / f"new-strategies-{stamp}.md"
+    md.write_text(report2(res, meta))
+    frames = [pd.DataFrame(tr).assign(version=name) for name, (_, tr, _) in res.items() if tr]
+    if frames:
+        pd.concat(frames).to_csv(out_dir / f"new-strategies-{stamp}-trades.csv", index=False)
+    log.info("wrote %s", md)
+    return md
+
+
 # ======================= main =======================
 def run(months: float, top: int, out_dir: Path) -> Path:
     from alpaca.data.enums import DataFeed
@@ -501,10 +838,15 @@ def run(months: float, top: int, out_dir: Path) -> Path:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=float, default=3)
-    ap.add_argument("--top", type=int, default=30, help="gap-up stocks per day to replay")
+    ap.add_argument("--top", type=int, default=30, help="gap-up stocks per day to replay (classic suite)")
+    ap.add_argument("--suite", default="new", choices=["new", "classic"],
+                    help="new = stocks-in-play ORB, news split, last-half-hour momentum; classic = the old bot")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
-    run(a.months, a.top, ROOT / "results")
+    if a.suite == "new":
+        run_new(a.months, ROOT / "results")
+    else:
+        run(a.months, a.top, ROOT / "results")
 
 
 if __name__ == "__main__":
