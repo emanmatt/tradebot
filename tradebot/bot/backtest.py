@@ -21,8 +21,13 @@ import math
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import warnings
+
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+warnings.filterwarnings("ignore", message="Mean of empty slice")
 
 from .config import ROOT, env, load_config
 
@@ -68,7 +73,7 @@ def daily_bars(dc, syms: list[str], start: date, end: date, feed) -> pd.DataFram
             log.info("  daily bars: %d / %d symbols", i, len(syms))
     df = pd.concat(frames).reset_index()
     df["day"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(ET).dt.date
-    return df
+    return df.drop_duplicates(["symbol", "day"])
 
 
 def pick_candidates(daily: pd.DataFrame, days: list[date], c: dict, top: int) -> dict:
@@ -317,7 +322,7 @@ def stats(trades: list[dict], daily: list[dict], start_equity: float = 100.0) ->
     eq = pd.Series([start_equity] + [d["equity"] for d in daily])
     dd = ((eq.cummax() - eq) / eq.cummax()).max() * 100
     half = len(t) // 2
-    return {
+    out = {
         "trades": len(t), "per_day": round(len(t) / max(len(daily), 1), 1),
         "win_pct": round(len(wins) / len(t) * 100, 1),
         "avg_win_r": round(wins.r.mean(), 2) if len(wins) else 0.0,
@@ -332,6 +337,7 @@ def stats(trades: list[dict], daily: list[dict], start_equity: float = 100.0) ->
         "never_up_losers_pct": round((losses.mfe_r <= 0.1).mean() * 100, 0) if len(losses) else 0.0,
         "avg_hold": round(t.hold_min.mean(), 1),
     }
+    return {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in out.items()}
 
 
 def verdict(s: dict) -> str:
@@ -418,11 +424,11 @@ def run(months: float, top: int, out_dir: Path) -> Path:
     log.info("Listing symbols...")
     syms = all_symbols(tc)
     log.info("%d symbols. Daily bars %s..%s", len(syms), start, end)
-    daily = daily_bars(dc, syms + ["SPY"], start - timedelta(days=45), end, sip)
-    spy_d = daily[daily.symbol == "SPY"].set_index("day")
-    days = [d for d in spy_d.index if start <= d <= end]
+    daily = daily_bars(dc, sorted(set(syms) | {"SPY"}), start - timedelta(days=45), end, sip)
+    spy_d = daily[daily.symbol == "SPY"].drop_duplicates("day").set_index("day").sort_index()
+    days = sorted({d for d in spy_d.index if start <= d <= end})
     cands = pick_candidates(daily, days, c, top)
-    spy_ret = (spy_d.loc[days[-1], "close"] / spy_d.loc[days[0], "open"] - 1) * 100
+    spy_ret = float((spy_d.loc[days[-1], "close"] / spy_d.loc[days[0], "open"] - 1) * 100)
 
     log.info("%d trading days; fetching minute bars...", len(days))
     raw_sip, raw_iex, spy_min = {}, {}, {}
@@ -450,19 +456,30 @@ def run(months: float, top: int, out_dir: Path) -> Path:
         vw = (tp * g["volume"]).cumsum() / g["volume"].cumsum().replace(0, np.nan)
         spy_ok[d] = ((g["close"] > vw) & (g["close"] > g["open"].iloc[0])).fillna(False).to_numpy()
 
-    def prepped(raw):
+    def prepped(raw, scale_to=None):
+        """scale_to: when signals come from IEX, shrink the normal-volume baseline to IEX's share
+        of that stock's volume (the live bot compares IEX volume with IEX history)."""
         out = {}
         for d in days:
             out[d] = {}
             for s, g in raw.get(d, {}).items():
                 info = cands[d].get(s)
-                if info:
-                    f = prep(g, info["prev_close"], info["avg_vol"], profile, c)
-                    if f:
-                        out[d][s] = f
+                if not info:
+                    continue
+                avg = info["avg_vol"]
+                if scale_to is not None:
+                    full = scale_to.get(d, {}).get(s)
+                    share = g["volume"].sum() / max(full["volume"].sum(), 1) if full is not None else 0
+                    if share <= 0:
+                        continue
+                    avg *= share
+                f = prep(g, info["prev_close"], avg, profile, c)
+                if f:
+                    out[d][s] = f
         return out
 
-    P_sip, P_iex = prepped(raw_sip), prepped(raw_iex)
+    P_sip = prepped(raw_sip)
+    P_iex = prepped(raw_iex, scale_to=raw_sip) if sip != DataFeed.IEX else P_sip
     results = {}
     for v in VARIANTS:
         S = P_iex if v.signal_feed == "iex" else P_sip
