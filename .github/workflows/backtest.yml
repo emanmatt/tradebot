@@ -1,0 +1,61 @@
+name: Backtest
+
+# Run from the Actions tab (or the GitHub app): Backtest -> Run workflow.
+# Replays the day-trading rules over past months and saves the report to tradebot/results/.
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "How many past months to replay"
+        default: "3"
+      top:
+        description: "Gap-up stocks per day to replay"
+        default: "30"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: backtest
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: tradebot
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run backtest
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python -m bot.backtest --months "${{ inputs.months }}" --top "${{ inputs.top }}"
+      - name: Save results
+        if: always()
+        run: |
+          git config user.name "tradebot"
+          git config user.email "tradebot@users.noreply.github.com"
+          git add -f results/ 2>/dev/null || true
+          git diff --cached --quiet && exit 0
+          git commit -q -m "backtest results $(date -u +%F)"
+          for i in 1 2 3; do
+            git fetch -q origin main
+            if git rebase -q -X theirs origin/main && git push -q origin HEAD:main; then
+              echo "results saved"; exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          exit 1
