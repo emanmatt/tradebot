@@ -737,6 +737,256 @@ def run_new(months: float, out_dir: Path) -> Path:
     return md
 
 
+# ======================= suite "pack": the day-trader-skill system (Jakeschincariol/day-trader-skill) ========
+# Ported rules: liquid US stocks (price >= $5, yesterday's volume >= 1M), optional pre-market watchlist of five
+# daily-close setups, 15-minute opening range on 5-minute bars, buy after the first 5-minute bar that CLOSES above
+# the range high (9:45-15:30), stop at the range midpoint, target 2R (or 1R), flat at 15:55, max 3 trades a day,
+# ~1% of the account risked per trade, no new trades after a -3% day.
+PACK = {"min_price": 5.0, "min_prev_vol": 1_000_000, "liquid_top": 200, "tag_top": 50, "or_bars5": 3,
+        "last_entry_bar5": 71, "flat_bar5": 77, "max_trades": 3, "risk_pct": 1.0, "max_alloc_pct": 33.0,
+        "daily_loss_pct": 3.0, "slip": 0.01, "min_risk_pct": 0.05}
+N5 = 78                                      # 5-minute bars 9:30..15:55
+SETUPS = ("breakout_20d", "bull_flag", "reclaim_ma20", "oversold", "oversold_bounce")
+
+
+def wilder_rsi(c: np.ndarray, n: int = 14) -> float | None:
+    if len(c) < n + 1:
+        return None
+    d = np.diff(c)
+    g, lo = np.maximum(d, 0), np.maximum(-d, 0)
+    ag, al = g[:n].mean(), lo[:n].mean()
+    for i in range(n, len(d)):
+        ag = (ag * (n - 1) + g[i]) / n
+        al = (al * (n - 1) + lo[i]) / n
+    return 100 - 100 / (1 + ag / al) if al else 100.0
+
+
+def pack_setups(c: np.ndarray) -> list[str]:
+    """The pack's find_setups() on daily closes up to YESTERDAY (oldest first, >= 30)."""
+    if len(c) < 30:
+        return []
+    last, hi20 = c[-1], c[-21:-1].max()
+    ma20, ma20_prev = c[-20:].mean(), c[-21:-1].mean()
+    run, rng5 = c[-6] / c[-16] - 1, (c[-5:].max() - c[-5:].min()) / last
+    r, r_prev = wilder_rsi(c), wilder_rsi(c[:-1])
+    tags = []
+    if last > hi20:
+        tags.append("breakout_20d")
+    if run > 0.10 and rng5 < 0.05:
+        tags.append("bull_flag")
+    if c[-2] < ma20_prev and last > ma20:
+        tags.append("reclaim_ma20")
+    if r is not None and r < 30:
+        tags.append("oversold")
+    if r_prev is not None and r_prev < 30 and last > c[-2]:
+        tags.append("oversold_bounce")
+    return tags
+
+
+def pack_universe(daily: pd.DataFrame, days: list[date], cfg: dict) -> dict:
+    """{day: {symbol: {"dvol": prev-day $ volume, "tags": [...]}}} using only data before each day."""
+    d = daily.sort_values(["symbol", "day"])
+    out = {day: {} for day in days}
+    want = set(days)
+    for s, g in d.groupby("symbol"):
+        closes, vols, ds = g["close"].to_numpy(float), g["volume"].to_numpy(float), list(g["day"])
+        for i, day in enumerate(ds):
+            if day not in want or i < 1:
+                continue
+            pc, pv = closes[i - 1], vols[i - 1]
+            if pc < cfg["min_price"] or pv < cfg["min_prev_vol"]:
+                continue
+            out[day][s] = {"dvol": pc * pv, "tags": pack_setups(closes[max(0, i - 60):i])}
+    picked = {}
+    for day, m in out.items():
+        top = sorted(m, key=lambda s: -m[s]["dvol"])
+        keep = set(top[:cfg["liquid_top"]])
+        for tag in SETUPS:
+            keep |= set([s for s in top if tag in m[s]["tags"]][:cfg["tag_top"]])
+        picked[day] = {s: m[s] for s in keep}
+    return picked
+
+
+def five_min_grid(dc, syms: list[str], d: date, feed) -> dict:
+    from alpaca.data.enums import Adjustment
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    start = datetime.combine(d, time(9, 30), ET)
+    grid = pd.date_range(start, periods=N5, freq="5min")
+    out = {}
+    for i in range(0, len(syms), 200):
+        req = StockBarsRequest(symbol_or_symbols=syms[i:i + 200], timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+                               start=start, end=start + timedelta(minutes=5 * N5), feed=feed,
+                               adjustment=Adjustment.SPLIT)
+        df = _retry(lambda: dc.get_stock_bars(req)).df
+        if df.empty:
+            continue
+        for s, g in df.groupby(level=0):
+            g = g.droplevel(0)
+            g.index = pd.DatetimeIndex(g.index).tz_convert(ET)
+            g = g[~g.index.duplicated()].reindex(grid)
+            if g["close"].iloc[:3].isna().any():          # the pack needs every range bar
+                continue
+            g["close"] = g["close"].ffill()
+            for col in ("open", "high", "low"):
+                g[col] = g[col].fillna(g["close"])
+            out[s] = g[["open", "high", "low", "close"]]
+    return out
+
+
+def pack_trade(g: pd.DataFrame, target_r: float, cfg: dict) -> dict | None:
+    o, h, l, c = (np.array(g[k], dtype=float) for k in ("open", "high", "low", "close"))
+    k = cfg["or_bars5"]
+    oh, ol = h[:k].max(), l[:k].min()
+    if not oh > ol:
+        return None
+    for t in range(k, cfg["last_entry_bar5"] + 1):
+        if c[t] > oh:                                      # first 5-minute bar to CLOSE above the range high
+            break
+    else:
+        return None
+    e_bar = t + 1                                          # we can only act once that bar has closed
+    if e_bar >= cfg["flat_bar5"]:
+        return None
+    gross_fill = o[e_bar]
+    fill = gross_fill + cfg["slip"]
+    stop = math.floor((oh + ol) / 2 * 100) / 100           # range midpoint, rounded down (as the pack does)
+    risk = fill - stop
+    if risk < fill * cfg["min_risk_pct"] / 100:
+        return None
+    target = round(fill + target_r * risk, 2)
+    exit_bar, gross_exit, why = cfg["flat_bar5"], o[cfg["flat_bar5"]], "flat 15:55"
+    for b in range(e_bar, cfg["flat_bar5"]):
+        if o[b] <= stop and b > e_bar:
+            exit_bar, gross_exit, why = b, o[b], "stop"
+            break
+        if l[b] <= stop:
+            exit_bar, gross_exit, why = b, min(stop, o[b]), "stop"
+            break
+        if h[b] >= target:
+            exit_bar, gross_exit, why = b, target, "target"
+            break
+    exit_px = gross_exit - (cfg["slip"] if why != "target" else 0)
+    return {"signal_bar": t, "entry_bar": e_bar, "exit_bar": exit_bar, "fill": fill, "stop": stop, "risk": risk,
+            "target": target, "exit": exit_px, "why": why, "r": (exit_px - fill) / risk,
+            "r_gross": (gross_exit - gross_fill) / (gross_fill - stop) if gross_fill > stop else 0.0}
+
+
+def run_pack(days: list[date], uni: dict, bars: dict, tag: str | None, target_r: float, cfg: dict,
+             start_equity: float = 100.0) -> tuple[list[dict], list[dict]]:
+    """tag None = all liquid names; 'any' = any watchlist setup; else one setup."""
+    eq, trades, daily = start_equity, [], []
+    for d in days:
+        cands = []
+        for s, info in uni.get(d, {}).items():
+            if tag == "any" and not info["tags"]:
+                continue
+            if tag not in (None, "any") and tag not in info["tags"]:
+                continue
+            g = bars.get(d, {}).get(s)
+            if g is None:
+                continue
+            tr = pack_trade(g, target_r, cfg)
+            if tr:
+                cands.append((tr["entry_bar"], -info["dvol"], s, tr))
+        cands.sort(key=lambda x: (x[0], x[1]))           # earliest trigger first; ties: most traded
+        day_eq, cash, open_pos, realized, n = eq, eq, [], 0.0, 0
+        for bar, _, s, tr in cands:
+            if n >= cfg["max_trades"]:
+                break
+            for p in [p for p in open_pos if p[0] < bar]:
+                cash += p[1]
+                realized += p[2]
+                open_pos.remove(p)
+            if realized <= -day_eq * cfg["daily_loss_pct"] / 100:
+                break
+            qty = min(day_eq * cfg["risk_pct"] / 100 / tr["risk"], day_eq * cfg["max_alloc_pct"] / 100 / tr["fill"],
+                      cash / tr["fill"])
+            if qty * tr["fill"] < 1.0:
+                continue
+            pl = (tr["exit"] - tr["fill"]) * qty
+            cash -= qty * tr["fill"]
+            open_pos.append((tr["exit_bar"], qty * tr["fill"] + pl, pl))
+            n += 1
+            trades.append({"day": d.isoformat(), "symbol": s, "entry_time": f"{9 + (30 + 5 * bar) // 60:02d}:"
+                           f"{(30 + 5 * bar) % 60:02d}", "why": tr["why"], "qty": round(qty, 4),
+                           "fill": round(tr["fill"], 4), "stop": tr["stop"], "target": tr["target"],
+                           "exit": round(tr["exit"], 4), "pl": round(pl, 4), "r": round(tr["r"], 3),
+                           "r_gross": round(tr["r_gross"], 3), "tags": ",".join(uni[d][s]["tags"])})
+        eq += sum(t["pl"] for t in trades if t["day"] == d.isoformat())
+        daily.append({"day": d.isoformat(), "equity": round(eq, 4)})
+    return trades, daily
+
+
+PACK_VARIANTS = [("PACK ORB, top-200 liquid, 2R", None, 2.0), ("PACK ORB, top-200 liquid, 1R", None, 1.0),
+                 ("PACK ORB, any watchlist setup, 2R", "any", 2.0)] + \
+                [(f"PACK ORB, {t}, 2R", t, 2.0) for t in SETUPS]
+
+
+def run_pack_suite(months: float, out_dir: Path) -> Path:
+    from alpaca.data.enums import DataFeed
+    cfg = PACK
+    tc, dc = _clients()
+    end = datetime.now(ET).date() - timedelta(days=1)
+    start = end - timedelta(days=int(months * 30.5))
+    sip = DataFeed.SIP
+    log.info("Listing symbols...")
+    syms = sorted(set(all_symbols(tc)) | {"SPY"})
+    daily = daily_bars(dc, syms, start - timedelta(days=100), end, sip)
+    spy = daily[daily.symbol == "SPY"].drop_duplicates("day").set_index("day").sort_index()
+    days = sorted(d for d in spy.index if start <= d <= end)
+    uni = pack_universe(daily[daily.symbol != "SPY"], days, cfg)
+    log.info("%d days, ~%d stocks/day; fetching 5-minute bars...", len(days), int(np.mean([len(u) for u in uni.values()])))
+    bars = {}
+    for i, d in enumerate(days):
+        try:
+            bars[d] = five_min_grid(dc, sorted(uni[d]), d, sip)
+        except Exception as e:  # noqa: BLE001
+            log.warning("  %s failed: %s", d, e)
+        if (i + 1) % 10 == 0:
+            log.info("  %d / %d days", i + 1, len(days))
+    days = [d for d in days if d in bars]
+    res = {}
+    for name, tag, tr_ in PACK_VARIANTS:
+        tr, dl = run_pack(days, uni, bars, tag, tr_, cfg)
+        res[name] = (stats2(tr, dl, "R"), tr, dl)
+        log.info("%-40s %s", name, res[name][0])
+    tag_counts = {t: float(np.mean([sum(t in v["tags"] for v in uni[d].values()) for d in days])) for t in SETUPS}
+    L = [f"# day-trader-skill pack backtest: {days[0]} to {days[-1]}", "",
+         f"{len(days)} trading days. Rules ported from github.com/Jakeschincariol/day-trader-skill: 15-min opening "
+         "range on 5-min bars, buy at the next bar's open after the first 5-min CLOSE above the range high "
+         "(9:45-15:30), stop at the range midpoint, flat 15:55, max 3 trades/day, 1% risk, no new trades after "
+         "a -3% day. $100, long only, fractional shares, max 33% per position, 1 cent per share each way. "
+         f"SPY over the period: {float((spy.loc[days[-1], 'close'] / spy.loc[days[0], 'open'] - 1) * 100):+.1f}%.", "",
+         "Watchlist names per day (avg, before the top-50 cap): "
+         + ", ".join(f"{t} {v:.0f}" for t, v in tag_counts.items()), "",
+         "| Version | Trades | /day | Win % | Avg win R | Avg loss R | Avg R after costs | Avg R before costs "
+         "| Profit factor | Return | Max DD | 1st half R | 2nd half R | Verdict |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for name, (s_, _, _) in res.items():
+        if not s_.get("trades"):
+            L.append(f"| {name} | 0 | | | | | | | | | | | | no trades |")
+            continue
+        L.append(f"| {name} | {s_['trades']} | {s_['per_day']} | {s_['win_pct']} | {s_['avg_win']} | "
+                 f"{s_['avg_loss']} | {s_['avg']:+.3f} | {s_['gross']:+.3f} | {s_['pf']} | {s_['return_pct']:+.1f}% | "
+                 f"{s_['max_dd_pct']}% | {s_['first_half']:+.3f} | {s_['second_half']:+.3f} | {verdict2(s_)} |")
+    for name, (s_, tr, _) in res.items():
+        if tr:
+            t = pd.DataFrame(tr)
+            g = t.groupby(t.day.str[:7]).agg(n=("r", "size"), avg=("r", "mean"), pl=("pl", "sum"))
+            L += ["", f"### {name}", "Exits: " + ", ".join(f"{k} {v}" for k, v in t.why.value_counts().items()),
+                  "By month: " + "; ".join(f"{m}: {int(r.n)} trades, {r.avg:+.3f}R, ${r.pl:+.2f}" for m, r in g.iterrows())]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(ET).strftime("%Y-%m-%d")
+    md = out_dir / f"pack-{stamp}.md"
+    md.write_text("\n".join(L) + "\n")
+    frames = [pd.DataFrame(tr).assign(version=n) for n, (_, tr, _) in res.items() if tr]
+    if frames:
+        pd.concat(frames).to_csv(out_dir / f"pack-{stamp}-trades.csv", index=False)
+    log.info("wrote %s", md)
+    return md
+
+
 # ======================= main =======================
 def run(months: float, top: int, out_dir: Path) -> Path:
     from alpaca.data.enums import DataFeed
@@ -839,13 +1089,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=float, default=3)
     ap.add_argument("--top", type=int, default=30, help="gap-up stocks per day to replay (classic suite)")
-    ap.add_argument("--suite", default="new", choices=["new", "classic"],
-                    help="new = stocks-in-play ORB, news split, last-half-hour momentum; classic = the old bot")
+    ap.add_argument("--suite", default="all", choices=["all", "new", "pack", "classic"],
+                    help="all = new + pack; new = stocks-in-play ORB, news split, last-half-hour momentum; "
+                         "pack = the day-trader-skill system; classic = the old bot")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
-    if a.suite == "new":
+    if a.suite in ("all", "pack"):
+        run_pack_suite(a.months, ROOT / "results")
+    if a.suite in ("all", "new"):
         run_new(a.months, ROOT / "results")
-    else:
+    if a.suite == "classic":
         run(a.months, a.top, ROOT / "results")
 
 
