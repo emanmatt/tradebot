@@ -64,9 +64,10 @@ def daily_bars(dc, syms: list[str], start: date, end: date, feed) -> pd.DataFram
     from alpaca.data.timeframe import TimeFrame
     frames = []
     for i in range(0, len(syms), 400):
-        df = dc.get_stock_bars(StockBarsRequest(
+        req = StockBarsRequest(
             symbol_or_symbols=syms[i:i + 400], timeframe=TimeFrame.Day, adjustment=Adjustment.SPLIT,
-            start=datetime.combine(start, time(0), ET), end=datetime.combine(end, time(23, 59), ET), feed=feed)).df
+            start=datetime.combine(start, time(0), ET), end=datetime.combine(end, time(23, 59), ET), feed=feed)
+        df = _retry(lambda: dc.get_stock_bars(req)).df
         if not df.empty:
             frames.append(df)
         if i and i % 2000 == 0:
@@ -440,8 +441,8 @@ def first5(dc, syms: list[str], d: date, feed) -> dict:
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     start = datetime.combine(d, time(9, 30), ET)
     out = {}
-    for i in range(0, len(syms), 400):
-        req = StockBarsRequest(symbol_or_symbols=syms[i:i + 400], timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+    for i in range(0, len(syms), 800):
+        req = StockBarsRequest(symbol_or_symbols=syms[i:i + 800], timeframe=TimeFrame(1, TimeFrameUnit.Minute),
                                start=start, end=start + timedelta(minutes=4, seconds=59), feed=feed,
                                adjustment=Adjustment.SPLIT)
         df = _retry(lambda: dc.get_stock_bars(req)).df
@@ -468,14 +469,21 @@ def news_counts(syms: list[str], start: datetime, end: datetime) -> dict:
     return dict(counts)
 
 
-def orb_trade(g: pd.DataFrame, atr: float, cfg: dict) -> dict | None:
+def orb_trade(g: pd.DataFrame, atr: float, cfg: dict, orh: float | None = None,
+              green: bool | None = None) -> dict | None:
     """Long-only 5-minute opening-range breakout held to the close (stop = 10% of daily ATR).
-    Returns None if the first 5 minutes weren't up or the breakout never came."""
+    Returns None if the first 5 minutes weren't up or the breakout never came.
+    orh/green: when the bot only sees IEX data, the range high and the direction come from IEX,
+    while the stop-buy order itself fills against the real (full-market) prices in g."""
     o, h, l, c = (np.array(g[k], dtype=float) for k in ("open", "high", "low", "close"))
     k5 = cfg["or_bars"]
-    if np.isnan(o[0]) or np.isnan(c[k5 - 1]) or c[k5 - 1] <= o[0]:
+    if green is None:
+        if np.isnan(o[0]) or np.isnan(c[k5 - 1]) or c[k5 - 1] <= o[0]:
+            return None
+    elif not green:
         return None
-    orh = np.nanmax(h[:k5])
+    if orh is None:
+        orh = np.nanmax(h[:k5])
     slip, last = cfg["slip"], cfg["exit_bar"]
     for t in range(k5, last + 1):
         if h[t] >= orh:
@@ -516,7 +524,7 @@ def run_orb(days: list[date], picks: dict, bars: dict, news: dict | None, which:
             g = bars.get(d, {}).get(s)
             if g is None:
                 continue
-            tr = orb_trade(g, info["atr"], cfg)
+            tr = orb_trade(g, info["atr"], cfg, info.get("orh"), info.get("green"))
             if tr:
                 cands.append((tr["entry_bar"], -info["rvol"], s, tr))
         cands.sort(key=lambda x: (x[0], x[1]))          # earliest breakout first; ties: most unusual volume
@@ -600,7 +608,9 @@ def report2(res: dict, meta: dict) -> str:
          f"(max 20% of the account per position). "
          f"Costs: 1 cent per share on every buy and sell. Full-market (SIP) minute data. "
          f"SPY over the period: {meta['spy_ret']:+.1f}%.", "",
-         f"Stocks in play per day (avg): {meta['avg_in_play']:.1f}; with overnight news: {meta['news_share']}.", "",
+         f"Stocks in play per day (avg): {meta['avg_in_play']:.1f}; with overnight news: {meta['news_share']}."
+         + (f" IEX-only picks that match the full-market picks: {meta['overlap']:.0f}%." if meta.get("overlap") is not None
+            else ""), "",
          "## Opening-range breakout on stocks in play (results in R = multiples of the amount risked)", "",
          "| Version | Trades | /day | Win % | Avg win R | Avg loss R | Avg R after costs | Avg R before costs "
          "| Profit factor | Return | Max DD | 1st half R | 2nd half R | Verdict |",
@@ -640,7 +650,7 @@ def report2(res: dict, meta: dict) -> str:
     return "\n".join(L) + "\n"
 
 
-def run_new(months: float, out_dir: Path) -> Path:
+def run_new(months: float, out_dir: Path, with_news: bool = False, with_iex: bool = True) -> Path:
     from alpaca.data.enums import DataFeed
     import time as _t
     cfg = ORB
@@ -659,12 +669,13 @@ def run_new(months: float, out_dir: Path) -> Path:
     warm = [d for d in all_days if d < start][-(cfg["rvol_days"] + 2):]
 
     # 1) first-5-minute volume for every liquid stock, every day (warm-up days build the baseline)
-    hist = defaultdict(list)
-    picks, n_in_play = {}, []
+    hist, hist_iex = defaultdict(list), defaultdict(list)
+    picks, picks_iex, n_in_play = {}, {}, []
     for i, d in enumerate(warm + days):
         g = by_day[d]
         ok = g[(g.prev_close >= cfg["min_price"]) & (g.avg_vol14 >= cfg["min_avg_vol"]) & (g.atr14 >= cfg["min_atr"])]
         f5 = first5(dc, ok.symbol.tolist(), d, sip)
+        f5i = first5(dc, ok.symbol.tolist(), d, DataFeed.IEX) if with_iex else {}
         _t.sleep(0.2)
         if d in days:
             rows = []
@@ -679,8 +690,22 @@ def run_new(months: float, out_dir: Path) -> Path:
             rows.sort(reverse=True)
             picks[d] = {s: {"rvol": rv, "atr": atr[s]} for rv, s in rows[:cfg["top"]]}
             n_in_play.append(len(picks[d]))
+            # what a live bot on the free plan sees: IEX volume vs IEX history, IEX range high and direction
+            rows_i = []
+            for s, (o, c, h, v) in f5i.items():
+                past = hist_iex[s][-cfg["rvol_days"]:]
+                if len(past) < cfg["min_rvol_history"] or o < cfg["min_price"]:
+                    continue
+                rv = v / max(np.mean(past), 1)
+                if rv >= cfg["min_rvol"]:
+                    rows_i.append((rv, s))
+            rows_i.sort(reverse=True)
+            picks_iex[d] = {s: {"rvol": rv, "atr": atr[s], "orh": f5i[s][2], "green": f5i[s][1] > f5i[s][0]}
+                            for rv, s in rows_i[:cfg["top"]]}
         for s, (_, _, _, v) in f5.items():
             hist[s].append(v)
+        for s, (_, _, _, v) in f5i.items():
+            hist_iex[s].append(v)
         if (i + 1) % 10 == 0:
             log.info("  first-5-min scan: %d / %d days", i + 1, len(warm) + len(days))
 
@@ -689,13 +714,13 @@ def run_new(months: float, out_dir: Path) -> Path:
     prev_close = {d: {s: float(by_day[d].set_index("symbol").prev_close.get(s, np.nan)) for s in ("SPY", "QQQ")}
                   for d in days}
     for i, d in enumerate(days):
-        want = sorted(set(picks.get(d, {})) | {"SPY", "QQQ"})
+        want = sorted(set(picks.get(d, {})) | set(picks_iex.get(d, {})) | {"SPY", "QQQ"})
         try:
             bars[d] = _retry(lambda: minute_grid(dc, want, d, sip))
         except Exception as e:  # noqa: BLE001
             log.warning("  %s minute bars failed: %s", d, e)
             continue
-        if news_ok and picks.get(d):
+        if with_news and news_ok and picks.get(d):
             prev_day = all_days[all_days.index(d) - 1]
             try:
                 news[d] = news_counts(list(picks[d]), datetime.combine(prev_day, time(16, 0), ET),
@@ -707,6 +732,8 @@ def run_new(months: float, out_dir: Path) -> Path:
             log.info("  minute bars + news: %d / %d days", i + 1, len(days))
     days = [d for d in days if d in bars]
 
+    if not with_news:
+        news = None
     res = {}
     for name, which in (("ORB stocks in play (all)", "all"), ("ORB with overnight news", "news"),
                         ("ORB without news", "no_news")):
@@ -715,6 +742,14 @@ def run_new(months: float, out_dir: Path) -> Path:
         tr, dl = run_orb(days, picks, bars, news, which, cfg)
         res[name] = (stats2(tr, dl, "R"), tr, dl)
         log.info("%-32s %s", name, res[name][0])
+    if with_iex:
+        tr, dl = run_orb(days, picks_iex, bars, None, "all", cfg)
+        res["ORB stocks in play, IEX-only view (live on free plan)"] = (stats2(tr, dl, "R"), tr, dl)
+        log.info("ORB IEX view %s", res["ORB stocks in play, IEX-only view (live on free plan)"][0])
+        same = [len(set(picks.get(d, {})) & set(picks_iex.get(d, {}))) / max(len(picks.get(d, {})), 1) for d in days]
+        overlap = float(np.mean(same)) * 100 if same else 0.0
+    else:
+        overlap = None
     for sym in ("SPY", "QQQ"):
         tr, dl = run_momentum(days, bars, prev_close, sym)
         res[f"MOM {sym} last half-hour"] = (stats2(tr, dl, "%"), tr, dl)
@@ -725,14 +760,15 @@ def run_new(months: float, out_dir: Path) -> Path:
     meta = {"start": days[0], "end": days[-1], "days": len(days),
             "spy_ret": float((spy.loc[days[-1], "close"] / spy.loc[days[0], "open"] - 1) * 100),
             "avg_in_play": float(np.mean(n_in_play)) if n_in_play else 0.0,
-            "news_share": f"{np.mean(in_play_news) * 100:.0f}%" if in_play_news else "n/a"}
+            "news_share": f"{np.mean(in_play_news) * 100:.0f}%" if in_play_news else "not checked",
+            "overlap": overlap}
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(ET).strftime("%Y-%m-%d")
-    md = out_dir / f"new-strategies-{stamp}.md"
+    md = out_dir / f"new-strategies-{stamp}-{months:g}m.md"
     md.write_text(report2(res, meta))
     frames = [pd.DataFrame(tr).assign(version=name) for name, (_, tr, _) in res.items() if tr]
     if frames:
-        pd.concat(frames).to_csv(out_dir / f"new-strategies-{stamp}-trades.csv", index=False)
+        pd.concat(frames).to_csv(out_dir / f"new-strategies-{stamp}-{months:g}m-trades.csv", index=False)
     log.info("wrote %s", md)
     return md
 
@@ -978,11 +1014,11 @@ def run_pack_suite(months: float, out_dir: Path) -> Path:
                   "By month: " + "; ".join(f"{m}: {int(r.n)} trades, {r.avg:+.3f}R, ${r.pl:+.2f}" for m, r in g.iterrows())]
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(ET).strftime("%Y-%m-%d")
-    md = out_dir / f"pack-{stamp}.md"
+    md = out_dir / f"pack-{stamp}-{months:g}m.md"
     md.write_text("\n".join(L) + "\n")
     frames = [pd.DataFrame(tr).assign(version=n) for n, (_, tr, _) in res.items() if tr]
     if frames:
-        pd.concat(frames).to_csv(out_dir / f"pack-{stamp}-trades.csv", index=False)
+        pd.concat(frames).to_csv(out_dir / f"pack-{stamp}-{months:g}m-trades.csv", index=False)
     log.info("wrote %s", md)
     return md
 
@@ -1089,7 +1125,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=float, default=3)
     ap.add_argument("--top", type=int, default=30, help="gap-up stocks per day to replay (classic suite)")
-    ap.add_argument("--suite", default="all", choices=["all", "new", "pack", "classic"],
+    ap.add_argument("--suite", default="new", choices=["all", "new", "pack", "classic"],
                     help="all = new + pack; new = stocks-in-play ORB, news split, last-half-hour momentum; "
                          "pack = the day-trader-skill system; classic = the old bot")
     a = ap.parse_args()
