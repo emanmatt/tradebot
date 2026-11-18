@@ -1125,11 +1125,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=float, default=3)
     ap.add_argument("--top", type=int, default=30, help="gap-up stocks per day to replay (classic suite)")
-    ap.add_argument("--suite", default="new", choices=["all", "new", "pack", "classic"],
-                    help="all = new + pack; new = stocks-in-play ORB, news split, last-half-hour momentum; "
+    ap.add_argument("--suite", default="swing", choices=["swing", "all", "new", "pack", "classic"],
+                    help="swing = 1-5 day strategies on ~10 years of daily data; all = new + pack; "
+                         "new = stocks-in-play ORB, news split, last-half-hour momentum; "
                          "pack = the day-trader-skill system; classic = the old bot")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
+    if a.suite == "swing":
+        from .swing import run_swing
+        tc, dc = _clients()
+        end = datetime.now(ET).date() - timedelta(days=1)
+        start = max(date(2016, 11, 1), end - timedelta(days=int(a.months * 30.5)))   # 200-day avg needs warm-up
+        run_swing(dc, all_symbols(tc), start, end, ROOT / "results", retry=_retry)
     if a.suite in ("all", "pack"):
         run_pack_suite(a.months, ROOT / "results")
     if a.suite in ("all", "new"):
