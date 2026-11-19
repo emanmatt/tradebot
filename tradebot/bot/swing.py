@@ -355,3 +355,133 @@ def write_report(res: dict, dates: list[date], out_dir: Path) -> Path:
     pd.DataFrame({n: c for n, (_, _, c) in res.items()}).to_csv(out_dir / f"swing-{stamp}-equity.csv")
     log.info("wrote %s", md)
     return md
+
+
+# ======================= IBS robustness test =======================
+ROBUST_ETFS = {
+    "SPY": "S&P 500", "QQQ": "Nasdaq-100", "IWM": "small caps", "DIA": "Dow 30", "MDY": "mid caps",
+    "XLK": "tech", "SMH": "semiconductors", "XLF": "financials", "XLV": "healthcare", "XLE": "energy",
+    "XLY": "consumer discretionary", "XLP": "consumer staples", "XLI": "industrials", "XLU": "utilities",
+    "XLB": "materials", "EFA": "developed intl", "EEM": "emerging markets", "GLD": "gold", "TLT": "long bonds",
+}
+EQUITY_ETFS = [s for s in ROBUST_ETFS if s not in ("GLD", "TLT")]
+
+
+def ibs_spec(name, syms, lo=0.10, hi=0.90, at="close", max_hold=None, slots=1):
+    return Spec(name, syms, slots, lambda x, lo=lo: x.ibs < lo, lambda x, hi=hi: x.ibs > hi,
+                rank=lambda x: x.ibs, enter_at="close" if at == "close" else "next_open",
+                exit_at="close" if at == "close" else "next_open", max_hold=max_hold, cost=ETF_COST)
+
+
+ROBUST_VARIANTS = [
+    ("10/90 close", dict()),
+    ("10/90 next open", dict(at="next_open")),
+    ("15/85 close", dict(lo=0.15, hi=0.85)),
+    ("20/80 close", dict(lo=0.20, hi=0.80)),
+    ("10/90 max 3 days", dict(max_hold=3)),
+]
+
+
+def ratio(p: dict) -> float:
+    return p["cagr"] / max(p["max_dd"], 1) if p else float("nan")
+
+
+def run_robust(dc, start: date, end: date, out_dir: Path, retry=lambda f: f()) -> Path:
+    warm = start - timedelta(days=320)
+    data = fetch_daily(dc, sorted(ROBUST_ETFS), warm, end, retry)
+    ind = {s: indicators(g) for s, g in data.items()}
+    dates = [d for d in ind["SPY"].index if start <= d <= end]
+    recent = dates[-504:]                                         # last ~2 years
+    rows, grid = [], {}
+    for s in ROBUST_ETFS:
+        if s not in ind:
+            continue
+        bh = ind[s]["close"].reindex(dates).ffill()
+        bh_p = perf(bh / bh.iloc[0] * 100, [])
+        bh_r = ind[s]["close"].reindex(recent).ffill()
+        bh_recent = perf(bh_r / bh_r.iloc[0] * 100, [])
+        grid[s] = {"bh": bh_p, "bh_recent": bh_recent}
+        for vname, kw in ROBUST_VARIANTS:
+            sp = ibs_spec(f"IBS {s} {vname}", [s], **kw)
+            tr, curve = simulate(sp, ind, dates, {})
+            p = perf(curve, tr)
+            tr2, curve2 = simulate(sp, ind, dates, {}, cost_mult=2.0)
+            p["cagr_2x_cost"] = perf(curve2, tr2).get("cagr", float("nan"))
+            trr, cr = simulate(sp, ind, recent, {})
+            p["recent"] = perf(cr, trr)
+            grid[s][vname] = p
+        log.info("%s done", s)
+
+    pools = [("Pool SPY+QQQ (2 slots)", ["SPY", "QQQ"], 2),
+             ("Pool 4 broad indexes (SPY QQQ IWM DIA, 2 slots)", ["SPY", "QQQ", "IWM", "DIA"], 2),
+             ("Pool all 17 stock ETFs (4 slots)", EQUITY_ETFS, 4)]
+    pool_res = {}
+    for name, syms, slots in pools:
+        sp = ibs_spec(name, syms, slots=slots)
+        tr, curve = simulate(sp, ind, dates, {})
+        p = perf(curve, tr)
+        tr2, curve2 = simulate(sp, ind, dates, {}, cost_mult=2.0)
+        p["cagr_2x_cost"] = perf(curve2, tr2).get("cagr", float("nan"))
+        trr, cr = simulate(sp, ind, recent, {})
+        p["recent"] = perf(cr, trr)
+        pool_res[name] = (p, tr)
+    return write_robust(grid, pool_res, dates, recent, out_dir)
+
+
+def write_robust(grid: dict, pools: dict, dates: list[date], recent: list[date], out_dir: Path) -> Path:
+    base = "10/90 close"
+    eq = [s for s in grid if s in EQUITY_ETFS]
+    pos = sum(grid[s][base]["cagr"] > 0 for s in eq)
+    beats_ratio = sum(ratio(grid[s][base]) > ratio(grid[s]["bh"]) for s in eq)
+    halves = sum(grid[s][base]["cagr_1st"] > 0 and grid[s][base]["cagr_2nd"] > 0 for s in eq)
+    costs = sum(grid[s][base]["cagr_2x_cost"] > 0 for s in eq)
+    recent_pos = sum(grid[s][base]["recent"].get("cagr", -1) > 0 for s in eq)
+    L = [f"# IBS robustness test: {dates[0]} to {dates[-1]}", "",
+         f"IBS = where the close sits in the day's range (0 = at the low, 1 = at the high). Base rule: buy when "
+         f"IBS < 0.10, sell when IBS > 0.90, trading at the close. $100 per fund, fractional shares, "
+         f"{ETF_COST * 100:.2f}% cost per side. 'Recent' = last {len(recent)} trading days "
+         f"({recent[0]} to {recent[-1]}).", "",
+         "## Scorecard for the base rule on the 17 stock-market funds", "",
+         f"- Made money: **{pos} of {len(eq)}**",
+         f"- Better return per unit of worst drop than just holding that same fund: **{beats_ratio} of {len(eq)}**",
+         f"- Made money in both halves of the period: **{halves} of {len(eq)}**",
+         f"- Still made money at double costs: **{costs} of {len(eq)}**",
+         f"- Made money in the recent 2 years: **{recent_pos} of {len(eq)}**", "",
+         "## Yearly growth (CAGR) for each fund and rule version", "",
+         "| Fund | What it is | Buy & hold | Buy & hold worst drop | " + " | ".join(v for v, _ in ROBUST_VARIANTS)
+         + " | Base: worst drop | Base: trades | Base: win % | Base: recent 2y | Buy & hold recent 2y |",
+         "|---|---|---|---|" + "---|" * len(ROBUST_VARIANTS) + "---|---|---|---|---|"]
+    for s, g in grid.items():
+        b = g[base]
+        L.append(f"| {s} | {ROBUST_ETFS[s]} | {g['bh']['cagr']:+.1f}% | {g['bh']['max_dd']:.0f}% | "
+                 + " | ".join(f"{g[v]['cagr']:+.1f}%" for v, _ in ROBUST_VARIANTS)
+                 + f" | {b['max_dd']:.0f}% | {b.get('trades', 0)} | {b.get('win', 0):.0f}% | "
+                 f"{b['recent'].get('cagr', float('nan')):+.1f}% | {g['bh_recent']['cagr']:+.1f}% |")
+    L += ["", "## Pooled versions (one account trading several funds)", "",
+          "| Portfolio | $100 becomes | CAGR | Worst drop | CAGR / drop | Trades | Win % | 1st half | 2nd half "
+          "| 2x costs | Recent 2y |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    spy = grid["SPY"]["bh"]
+    L.append(f"| SPY buy & hold | ${spy['final']:.0f} | {spy['cagr']:+.1f}% | {spy['max_dd']:.0f}% | "
+             f"{ratio(spy):.2f} | - | - | {spy['cagr_1st']:+.1f}% | {spy['cagr_2nd']:+.1f}% | - | "
+             f"{grid['SPY']['bh_recent']['cagr']:+.1f}% |")
+    for name, (p, _) in pools.items():
+        L.append(f"| {name} | ${p['final']:.0f} | {p['cagr']:+.1f}% | {p['max_dd']:.0f}% | {ratio(p):.2f} | "
+                 f"{p.get('trades', 0)} | {p.get('win', 0):.0f}% | {p['cagr_1st']:+.1f}% | {p['cagr_2nd']:+.1f}% | "
+                 f"{p['cagr_2x_cost']:+.1f}% | {p['recent'].get('cagr', float('nan')):+.1f}% |")
+    L += ["", "## Year by year, base rule (% return)", ""]
+    years = sorted({y for g in grid.values() for y in g[base].get("years", {})})
+    L.append("| Fund | " + " | ".join(str(y) for y in years) + " |")
+    L.append("|---|" + "---|" * len(years))
+    for s, g in grid.items():
+        L.append(f"| {s} | " + " | ".join(f"{g[base]['years'].get(y, float('nan')):+.1f}" for y in years) + " |")
+    for name, (p, _) in pools.items():
+        L.append(f"| {name} | " + " | ".join(f"{p['years'].get(y, float('nan')):+.1f}" for y in years) + " |")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    md = out_dir / f"ibs-robustness-{stamp}.md"
+    md.write_text("\n".join(L) + "\n")
+    frames = [pd.DataFrame(tr) for _, (_, tr) in pools.items() if tr]
+    if frames:
+        pd.concat(frames).to_csv(out_dir / f"ibs-robustness-{stamp}-pool-trades.csv", index=False)
+    log.info("wrote %s", md)
+    return md
