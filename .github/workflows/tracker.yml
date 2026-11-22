@@ -1,0 +1,73 @@
+name: Investor tracker
+
+# Checks insiders, Congress, hedge funds and crypto whales about every 15 minutes,
+# pushes alerts to your phone (ntfy app) and copies qualifying buys in the PAPER account.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "normal, dry-run (no orders/alerts) or test-alert"
+        type: choice
+        options: [normal, dry-run, test-alert]
+        default: normal
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tracker
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: tradebot
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: sudo apt-get install -y -qq poppler-utils >/dev/null
+      - run: pip install -q -r requirements.txt
+      - name: Check investors
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          OPENFIGI_API_KEY: ${{ secrets.OPENFIGI_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          case "${{ inputs.mode }}" in
+            dry-run)    python -m bot.tracker --dry-run ;;
+            test-alert) python -m bot.tracker --test-alert ;;
+            *)          python -m bot.tracker ;;
+          esac
+      - name: Save tracker data
+        if: always()
+        run: |
+          [ -f data/tracker.sqlite ] || exit 0
+          git config user.name "tradebot"
+          git config user.email "tradebot@users.noreply.github.com"
+          git add -f data/tracker.sqlite
+          git diff --cached --quiet && exit 0
+          git commit -q -m "tracker: $(date -u +%FT%H:%M)"
+          for i in 1 2 3; do
+            git fetch -q origin main
+            if git rebase -q -X theirs origin/main && git push -q origin HEAD:main; then
+              echo "tracker data saved"; exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          echo "::error::could not save tracker data"
+          exit 1
