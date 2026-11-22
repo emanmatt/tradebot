@@ -70,6 +70,44 @@ schedule:
 # SEC requires a contact in the User-Agent for EDGAR requests (your name + email)
 sec_user_agent: "Emmanuel emanmatt711@gmail.com"
 
+# ---------- STEP 1: SCANNER (python -m scanner.watchlist) ----------
+# Narrows ~8,000 US stocks to a short ranked watchlist, with the reason each one made it.
+scanner:
+  max_watchlist: 20             # final list size
+  smart_slots: 5                # up to 5 of those spots go to "smart money" picks even without a gap
+  watchlist_path: "data/watchlist.sqlite"   # separate file so it never collides with the trade journal
+  active_et: ["04:00", "16:00"] # only scan between these times (pre-market + regular session)
+
+  # ---- where candidates come from ----
+  universe_top: 100             # Alpaca "most active" + "top gainers" lists, this many each
+  extra_symbols: []             # always check these too, e.g. ["NVDA", "TSLA"]
+  exchanges: ["NYSE", "NASDAQ", "AMEX", "ARCA", "BATS"]   # skip OTC
+
+  # ---- momentum screen ----
+  min_price: 2
+  max_price: 50
+  min_gap_pct: 5                # up at least 5% from yesterday's close
+  max_gap_pct: 100              # ignore broken data
+  min_rvol: 3                   # volume at least 3x normal for this time of day
+  min_avg_dollar_volume: 5000000  # real market $ volume per day (free IEX data is scaled up, see below)
+  iex_volume_share: 0.025       # free IEX feed sees ~2.5% of all trading; used to scale IEX volume
+  baseline_days: 20             # "normal volume" = average of the last 20 days
+  # share of a normal day's volume that has traded by each time (ET); used for time-of-day relative volume
+  volume_curve: [["04:00", 0.0], ["09:30", 0.05], ["10:00", 0.17], ["11:00", 0.33], ["12:00", 0.45],
+                 ["13:00", 0.54], ["14:00", 0.64], ["15:00", 0.77], ["16:00", 1.0]]
+  news_lookback_hours: 18       # headlines since about yesterday's close count as a catalyst
+  require_news: false           # true = skip gappers with no headline
+
+  # ---- scoring (0..1) ----
+  weights: {gap: 0.35, rvol: 0.40, news: 0.25}
+  gap_full_pct: 20              # a 20% gap earns the full gap score
+  rvol_full: 10                 # 10x volume earns the full volume score
+
+  # ---- smart money screen (reads the investor tracker's data/tracker.sqlite) ----
+  smart_lookback_days: {insiders: 10, congress: 30, funds: 45}
+  smart_weights: {insiders: 0.6, congress: 0.25, funds: 0.25, cluster_bonus: 0.2}
+  smart_boost: 0.3              # how much a smart-money hit adds to a momentum stock's score
+
 # ---------- Who to follow ----------
 signals:
   weights:             # how much each source counts (normalized automatically)

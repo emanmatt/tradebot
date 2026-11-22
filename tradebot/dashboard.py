@@ -34,6 +34,8 @@ GH_REPO = os.environ.get("GH_REPO", "emanmatt/tradebot")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 WORKFLOW = "trade.yml"
 JOURNAL_IN_REPO = "tradebot/data/journal.sqlite"
+TRACKER_IN_REPO = "tradebot/data/tracker.sqlite"
+WATCHLIST_IN_REPO = "tradebot/data/watchlist.sqlite"
 
 st.set_page_config(page_title="Trade Bot", page_icon="📈", layout="centered")
 
@@ -59,6 +61,50 @@ def journal_bytes() -> bytes | None:
         return open(cfg["journal_path"], "rb").read()
     except OSError:
         return None
+
+
+@st.cache_data(ttl=60)
+def tracker_db():
+    raw = None
+    if GH_TOKEN:
+        try:
+            raw = gh("GET", f"/contents/{TRACKER_IN_REPO}", headers={"Accept": "application/vnd.github.raw"}).content
+        except Exception:  # noqa: BLE001
+            pass
+    if raw is None:
+        try:
+            raw = open(cfg["journal_path"].replace("journal.sqlite", "tracker.sqlite"), "rb").read()
+        except OSError:
+            return None
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        f.write(raw)
+    db = sqlite3.connect(f.name)
+    ev = pd.read_sql_query("SELECT ts, source, who, role, symbol, action, value_text, trade_date, days_late, "
+                           "detail, url, copied, note FROM events ORDER BY id DESC LIMIT 300", db)
+    cp = pd.read_sql_query("SELECT opened, source, who, symbol, notional, status, closed, exit_reason, pl_pct "
+                           "FROM copies ORDER BY id DESC", db)
+    return ev, cp
+
+
+@st.cache_data(ttl=60)
+def watchlist_data():
+    raw = None
+    if GH_TOKEN:
+        try:
+            raw = gh("GET", f"/contents/{WATCHLIST_IN_REPO}", headers={"Accept": "application/vnd.github.raw"}).content
+        except Exception:  # noqa: BLE001
+            pass
+    if raw is None:
+        try:
+            raw = open(os.path.join(os.path.dirname(cfg["journal_path"]), "watchlist.sqlite"), "rb").read()
+        except OSError:
+            return None
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        f.write(raw)
+    from scanner.watchlist import latest
+    db = sqlite3.connect(f.name)
+    scan = db.execute("SELECT ts, n_picks, n_rejected, rejected FROM scans ORDER BY ts DESC LIMIT 1").fetchone()
+    return latest(f.name), scan
 
 
 @st.cache_data(ttl=30)
@@ -142,7 +188,66 @@ if st.button("🔄 Refresh", width="stretch"):
     st.cache_data.clear()
     st.rerun()
 
-tab_pos, tab_bot, tab_ctl, tab_hist = st.tabs(["Positions", "Bot picks", "Controls", "History"])
+tab_wl, tab_trk, tab_pos, tab_bot, tab_ctl, tab_hist = st.tabs(
+    ["Watchlist", "Tracker", "Positions", "Bot picks", "Controls", "History"])
+
+# ---------- step 1: watchlist ----------
+with tab_wl:
+    W = watchlist_data()
+    if not W or not W[0]:
+        st.info("No watchlist yet. The Scanner runs every 30 minutes on weekdays from 4 AM ET.")
+    else:
+        picks, scan = W
+        st.caption(f"Scanned {scan[0][:16].replace('T', ' ')} UTC · {scan[1]} picks · {scan[2]} rejected")
+        KIND = {"momentum": "🚀", "smart money": "🧠", "both": "🚀🧠"}
+        for p in picks:
+            rv = f" · vol {p['rvol']:.1f}x" if p["rvol"] else ""
+            with st.expander(f"{p['rank']}. {KIND.get(p['kind'], '')} **{p['symbol']}** ${p['price']:.2f} · "
+                             f"{p['gap_pct']:+.1f}%{rv} · score {p['score']:.2f}"):
+                for r in p["reasons"]:
+                    st.write("• " + r)
+        with st.expander("Why other stocks were rejected"):
+            st.dataframe(pd.DataFrame(json.loads(scan[3] or "[]")), hide_index=True, width="stretch")
+
+# ---------- investor tracker ----------
+ICON = {"insiders": "💼", "congress": "🏛️", "funds": "🏦", "whales": "🐋"}
+with tab_trk:
+    T = tracker_db()
+    if T is None:
+        st.info("The tracker hasn't saved anything yet. It runs every 15 minutes once tracker.yml is uploaded.")
+    else:
+        ev, cp = T
+        opn = cp[cp["status"] == "open"]
+        done = cp[cp["status"] == "closed"]
+        a, b = st.columns(2)
+        a.metric("Open copies", len(opn), f"${opn['notional'].sum():,.2f} invested")
+        b.metric("Closed copies", len(done),
+                 f"{done['pl_pct'].mean():+.1f}% avg" if done["pl_pct"].notna().any() else None)
+        pick = st.multiselect("Show", list(ICON), default=list(ICON),
+                              format_func=lambda k: f"{ICON[k]} {k}")
+        only_copied = st.toggle("Only trades I copied")
+        view = ev[ev["source"].isin(pick)]
+        if only_copied:
+            view = view[view["copied"] == 1]
+        if view.empty:
+            st.info("No alerts yet. Insider buys show up within a day or two; Congress and funds are slower.")
+        for _, r in view.head(60).iterrows():
+            verb = {"buy": "🟢 bought", "sell": "🔴 sold", "short": "🔻 shorted", "cover": "↩️ covered"}.get(
+                r["action"], r["action"])
+            head = f"{ICON.get(r['source'], '')} **{r['symbol'] or ''}** · {r['who']} {verb}"
+            with st.expander(head + (" · ✅ copied" if r["copied"] else "")):
+                st.write(f"{r['role'] or ''} · {r['detail'] or ''}")
+                if r["value_text"]:
+                    st.write(f"Size: {r['value_text']}")
+                if r["trade_date"]:
+                    lag = f" · public {int(r['days_late'])} days later" if pd.notna(r["days_late"]) and r["days_late"] else ""
+                    st.write(f"Traded {r['trade_date']}{lag}")
+                st.caption(f"Seen {r['ts'][:16].replace('T', ' ')} UTC" + (f" · {r['note']}" if r["note"] else ""))
+                if r["url"]:
+                    st.link_button("Open filing", r["url"])
+        if not cp.empty:
+            st.subheader("Copies")
+            st.dataframe(cp.rename(columns={"notional": "$", "pl_pct": "P/L %"}), hide_index=True, width="stretch")
 
 # ---------- positions ----------
 with tab_pos:

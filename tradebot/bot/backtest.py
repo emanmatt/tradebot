@@ -1125,13 +1125,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=float, default=3)
     ap.add_argument("--top", type=int, default=30, help="gap-up stocks per day to replay (classic suite)")
-    ap.add_argument("--suite", default="robust", choices=["robust", "swing", "all", "new", "pack", "classic"],
-                    help="robust = IBS on ~19 funds and rule variants; "
+    ap.add_argument("--suite", default="scanner",
+                    choices=["scanner", "robust", "swing", "all", "new", "pack", "classic"],
+                    help="scanner = Step 1 watchlist picks vs. a control group; robust = IBS on ~19 funds and rule variants; "
                          "swing = 1-5 day strategies on ~10 years of daily data; all = new + pack; "
                          "new = stocks-in-play ORB, news split, last-half-hour momentum; "
                          "pack = the day-trader-skill system; classic = the old bot")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
+    if a.suite == "scanner":
+        from scanner.backtest import run as run_scanner
+        run_scanner(a.months, ROOT / "results", ["09:25", "09:35", "10:00"])
     if a.suite == "robust":
         from .swing import run_robust
         tc, dc = _clients()
