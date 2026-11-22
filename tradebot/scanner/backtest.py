@@ -243,7 +243,8 @@ def run(months: float, out_dir: Path, decisions: list[str]) -> Path:
     log.info("Listing symbols...")
     syms = sorted(set(all_symbols(tc)) | {"SPY"})
     log.info("%d symbols. Daily bars (full market)...", len(syms))
-    daily = daily_bars(dc, syms, start - timedelta(days=45), end + timedelta(days=5), DataFeed.SIP)
+    # free plan: full-market data must be 15+ min old, so never ask past yesterday
+    daily = daily_bars(dc, syms, start - timedelta(days=45), end, DataFeed.SIP)
     daily = daily.sort_values(["symbol", "day"])
     g = daily.groupby("symbol")
     daily["prev_close"] = g["close"].shift(1)
