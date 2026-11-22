@@ -1,0 +1,74 @@
+name: Scanner
+
+# Step 1: builds the ranked watchlist every 30 minutes on weekdays (pre-market from 4 AM ET to the close).
+# The 9:00-9:30 AM ET scan also sends the top 5 to your phone.
+on:
+  schedule:
+    - cron: "5,35 9-21 * * 1-5"     # UTC; the code itself skips times outside 4:00 AM - 4:00 PM ET
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Send the top 5 to my phone"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: tradebot
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Scan
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          HM=$(TZ=America/New_York date +%H%M)
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ARGS="--force"
+            [ "${{ inputs.push }}" = "true" ] && ARGS="$ARGS --push"
+          elif [ "$HM" -ge 900 ] && [ "$HM" -lt 930 ]; then
+            ARGS="--push"
+          fi
+          python -m scanner.watchlist $ARGS
+      - name: Save watchlist
+        if: always()
+        run: |
+          [ -f data/watchlist.sqlite ] || exit 0
+          git config user.name "tradebot"
+          git config user.email "tradebot@users.noreply.github.com"
+          git add -f data/watchlist.sqlite
+          git diff --cached --quiet && exit 0
+          git commit -q -m "watchlist: $(date -u +%FT%H:%M)"
+          for i in 1 2 3; do
+            git fetch -q origin main
+            if git rebase -q -X theirs origin/main && git push -q origin HEAD:main; then
+              echo "watchlist saved"; exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          echo "::error::could not save the watchlist"
+          exit 1
